@@ -5,18 +5,57 @@ Provides Haskell specific instantiation of the LanguageServer class. Contains va
 
 import logging
 import os
+import re
 import shutil
+import threading
 import time
+from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 from overrides import override
 
+from solidlsp import ls_types
 from solidlsp.ls import SolidLanguageServer
 from solidlsp.ls_config import LanguageServerConfig
+from solidlsp.lsp_protocol_handler import lsp_types
 from solidlsp.lsp_protocol_handler.server import ProcessLaunchInfo
 from solidlsp.settings import SolidLSPSettings
 
 log = logging.getLogger(__name__)
+
+# A cabal component stanza, e.g. "library", "executable foo", "test-suite foo-test".
+_CABAL_STANZA_RE = re.compile(r"^(library|executable|test-suite|benchmark|foreign-library)\b", re.IGNORECASE)
+_CABAL_FIELD_RE = re.compile(r"^(\s+)([A-Za-z-]+)\s*:\s*(.*)$")
+# A plain (non-operator) Haskell identifier; rename supports only these.
+_HS_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_']*")
+_HS_RESERVED_WORDS = frozenset(
+    {
+        "case",
+        "class",
+        "data",
+        "default",
+        "deriving",
+        "do",
+        "else",
+        "foreign",
+        "if",
+        "import",
+        "in",
+        "infix",
+        "infixl",
+        "infixr",
+        "instance",
+        "let",
+        "module",
+        "newtype",
+        "of",
+        "then",
+        "type",
+        "where",
+        "_",
+    }
+)
 
 
 class HaskellLanguageServer(SolidLanguageServer):
@@ -101,10 +140,259 @@ class HaskellLanguageServer(SolidLanguageServer):
             "haskell",
             solidlsp_settings,
         )
+        # HLS's default "singleComponent" loads each cabal component (library, executable, test
+        # suite) into its own session, so references and renames never cross a component boundary.
+        self._hls_session_loading: str = self._custom_settings.get("session_loading", "multipleComponents")
+        self._hls_progress_lock = threading.Lock()
+        self._hls_active_progress: set[str] = set()
+        self._hls_last_progress = time.monotonic()
+        self._hls_progress_begins = 0
+        self._hls_components_lock = threading.Lock()
+        self._hls_components_loaded = False
+        # True only when every component's file opened and HLS then went idle; renames depend on it.
+        self._hls_components_ready = False
 
     @override
     def is_ignored_dirname(self, dirname: str) -> bool:
         return super().is_ignored_dirname(dirname) or dirname in ["dist", "dist-newstyle", ".stack-work", ".cabal-sandbox"]
+
+    def _on_hls_progress(self, params: dict) -> None:
+        token = str(params.get("token"))
+        kind = (params.get("value") or {}).get("kind")
+        with self._hls_progress_lock:
+            if kind == "begin":
+                self._hls_active_progress.add(token)
+                self._hls_progress_begins += 1
+            elif kind == "end":
+                self._hls_active_progress.discard(token)
+            self._hls_last_progress = time.monotonic()
+
+    def _hls_wait_idle(self, quiet_seconds: float = 2.0, timeout_seconds: float = 300.0) -> bool:
+        """Waits until HLS reports no work in progress and has been silent for `quiet_seconds`."""
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            with self._hls_progress_lock:
+                busy = bool(self._hls_active_progress)
+                silent_for = time.monotonic() - self._hls_last_progress
+            if not busy and silent_for >= quiet_seconds:
+                return True
+            time.sleep(0.2)
+        log.warning("HLS still busy after %.0fs: %s", timeout_seconds, sorted(self._hls_active_progress))
+        return False
+
+    def _hls_is_ignored_path(self, path: Path, root: Path) -> bool:
+        return any(part.startswith(".") or self.is_ignored_dirname(part) for part in path.relative_to(root).parts[:-1])
+
+    def _hls_first_source_file(self, base: Path, root: Path) -> Path | None:
+        if not base.is_dir():
+            return None
+        files = sorted(p for p in base.rglob("*.hs") if not self._hls_is_ignored_path(p, root))
+        return files[0] if files else None
+
+    def _hls_component_files(self) -> list[str]:
+        """
+        One source file per cabal component (library, executable, test suite, benchmark), relative to the
+        repository root. Opening one is what makes HLS load that component into its session.
+        Without any parsable .cabal file (e.g. an hpack-only project), one file per top-level source directory.
+        """
+        root = Path(self.repository_root_path)
+        chosen: list[Path] = []
+        for cabal_file in sorted(root.rglob("*.cabal")):
+            if self._hls_is_ignored_path(cabal_file, root):
+                continue
+            package_dir = cabal_file.parent
+            stanzas: list[dict[str, Any]] = []
+            current: dict[str, Any] | None = None
+            lines = cabal_file.read_text(errors="replace").splitlines()
+            for i, line in enumerate(lines):
+                if _CABAL_STANZA_RE.match(line):
+                    current = {"hs-source-dirs": [], "main-is": None}
+                    stanzas.append(current)
+                    continue
+                if line and not line[0].isspace():
+                    current = None  # another top-level stanza (common, flag, source-repository) or field
+                    continue
+                field = _CABAL_FIELD_RE.match(line)
+                if current is None or field is None:
+                    continue
+                indent, key, value = len(field.group(1)), field.group(2).lower(), field.group(3)
+                for cont in lines[i + 1 :]:  # continuation lines are indented deeper and are not fields
+                    if not cont.strip() or len(cont) - len(cont.lstrip()) <= indent or _CABAL_FIELD_RE.match(cont):
+                        break
+                    value += " " + cont.strip()
+                if key == "hs-source-dirs":
+                    current["hs-source-dirs"] += [d for d in re.split(r"[,\s]+", value) if d]
+                elif key == "main-is":
+                    current["main-is"] = value.strip()
+            for stanza in stanzas:
+                dirs = stanza["hs-source-dirs"] or ["."]
+                found: Path | None = None
+                if stanza["main-is"]:
+                    found = next(
+                        (package_dir / d / stanza["main-is"] for d in dirs if (package_dir / d / stanza["main-is"]).is_file()), None
+                    )
+                for d in dirs:
+                    if found is None:
+                        found = self._hls_first_source_file(package_dir / d, root)
+                if found is not None:
+                    chosen.append(found)
+        if not chosen:
+            for top in sorted(p for p in root.iterdir() if p.is_dir() and not (p.name.startswith(".") or self.is_ignored_dirname(p.name))):
+                if (found := self._hls_first_source_file(top, root)) is not None:
+                    chosen.append(found)
+        unique = dict.fromkeys(p.resolve().relative_to(root.resolve()).as_posix() for p in chosen)
+        return list(unique)
+
+    def _ensure_hls_components_loaded(self) -> bool:
+        """
+        Opens one file of every cabal component once, then waits for HLS to finish loading and indexing.
+        In multi-component mode HLS adds a component to its session only when one of its files is opened,
+        so without this, references and renames see only the components the agent happened to touch.
+
+        :return: whether every component loaded and HLS went idle afterwards. Only then are references
+            complete enough to rename from. Loading is attempted once per server.
+        """
+        if self._hls_session_loading != "multipleComponents":
+            return False
+        with self._hls_components_lock:
+            if self._hls_components_loaded:
+                return self._hls_components_ready
+            files = self._hls_component_files()
+            log.info("Loading every cabal component into HLS by opening: %s", files)
+            all_opened = bool(files)
+            for relative_path in files:
+                try:
+                    with self.open_file(relative_path):
+                        self.server.send.document_symbol({"textDocument": {"uri": self._resolve_file_uri(relative_path)}})
+                except Exception as e:  # one unloadable component must not break references for the others
+                    log.warning("HLS could not load %s: %s", relative_path, e)
+                    all_opened = False
+            with self._hls_progress_lock:
+                self._hls_last_progress = time.monotonic()  # wait at least the quiet period after the last open
+            idle = self._hls_wait_idle()
+            self._hls_components_loaded = True
+            self._hls_components_ready = all_opened and idle
+            log.info(
+                "HLS component loading: %d files, all opened=%s, idle=%s, progress reports seen=%d",
+                len(files),
+                all_opened,
+                idle,
+                self._hls_progress_begins,
+            )
+            return self._hls_components_ready
+
+    @override
+    def _send_references_request(self, relative_file_path: str, line: int, column: int) -> list[lsp_types.Location] | None:
+        self._ensure_hls_components_loaded()
+        self._hls_wait_idle(timeout_seconds=60)  # let HLS re-index after edits made earlier in the session
+        return super()._send_references_request(relative_file_path, line, column)
+
+    def _hls_project_mentions(self, name: str) -> list[str]:
+        """Project .hs files in which `name` occurs as an identifier (qualified or not)."""
+        root = Path(self.repository_root_path)
+        pattern = re.compile(rf"(?<![A-Za-z0-9_']){re.escape(name)}(?![A-Za-z0-9_'])")
+        hits = []
+        for path in sorted(root.rglob("*.hs")):
+            if not self._hls_is_ignored_path(path, root) and pattern.search(path.read_text(errors="replace")):
+                hits.append(path.relative_to(root).as_posix())
+        return hits
+
+    @staticmethod
+    def _hls_is_record_pun(line: str, start: int, end: int) -> bool:
+        """Whether line[start:end] is a field pun (`R {field}`): renaming it would also rename the bound variable."""
+        before, after = line[:start].rstrip(), line[end:].lstrip()
+        opener = max(before.rfind("{"), before.rfind("("), before.rfind("["))
+        return opener >= 0 and before[opener] == "{" and before[-1:] in ("{", ",") and after[:1] in ("}", ",")
+
+    @override
+    def request_rename_symbol_edit(
+        self,
+        relative_file_path: str,
+        line: int,
+        column: int,
+        new_name: str,
+    ) -> ls_types.WorkspaceEdit | None:
+        """
+        Renames from HLS's references instead of HLS's own rename. HLS refuses to rename exported names, and
+        with its experimental crossModule option it renames only inside the component holding the definition
+        while reporting success. Its references, once every component is loaded, include the export list, the
+        type signature, every equation head and qualified uses, so each one becomes an edit of exactly the name.
+
+        Every condition under which those references could be incomplete, or the edits could produce invalid
+        code, refuses the whole rename instead of returning a partial or broken one: components not all loaded
+        (or single-component loading), HLS still busy, a reserved or already-used new name, a reference that
+        is not the name, lies outside the project, or is a record field pun.
+        """
+        with self.open_file(relative_file_path) as file_buffer:
+            symbol_line = file_buffer.contents.splitlines()[line]
+        old_name = next((m.group(0) for m in _HS_IDENT_RE.finditer(symbol_line) if m.start() <= column < m.end()), None)
+        if old_name is None or not _HS_IDENT_RE.fullmatch(new_name) or self._hls_session_loading != "multipleComponents":
+            # operators, or single-component loading: HLS's own rename, which refuses rather than stops short
+            return super().request_rename_symbol_edit(relative_file_path, line, column, new_name)
+
+        def refuse(reason: str) -> ValueError:
+            return ValueError(f"Refusing to rename '{old_name}' to '{new_name}': {reason}")
+
+        if old_name[0].isupper() != new_name[0].isupper():
+            raise refuse("Haskell names keep their case class")
+        if new_name in _HS_RESERVED_WORDS:
+            raise refuse("the new name is a reserved word")
+        if mentions := self._hls_project_mentions(new_name):
+            raise refuse(f"the new name already occurs in {', '.join(mentions[:5])}, so the result could clash or be ambiguous")
+        if not self._ensure_hls_components_loaded():
+            raise refuse("HLS did not load every cabal component, so references may be incomplete")
+        if not self._hls_wait_idle(timeout_seconds=120):
+            raise refuse("HLS is still indexing, so references may be incomplete")
+
+        with self.open_file(relative_file_path):
+            locations = self.server.send.references(
+                {
+                    "textDocument": {"uri": self._resolve_file_uri(relative_file_path)},
+                    "position": {"line": line, "character": column},
+                    "context": {"includeDeclaration": True},
+                }
+            )
+        if not locations:
+            raise refuse("HLS returned no references, not even the definition")
+
+        root = Path(self.repository_root_path).resolve()
+        file_lines: dict[str, list[str]] = {}
+        changes: dict[str, list[ls_types.TextEdit]] = {}
+        seen: set[tuple[str, int, int]] = set()
+        for location in locations:
+            uri, start, end = location["uri"], location["range"]["start"], location["range"]["end"]
+            path = Path(unquote(urlparse(uri).path)).resolve()
+            where = f"{path}:{start['line'] + 1}"
+            if not path.is_relative_to(root):
+                raise refuse(f"a reference lies outside the project, at {where}")
+            if start["line"] != end["line"]:
+                raise refuse(f"multi-line reference at {where}")
+            if uri not in file_lines:
+                file_lines[uri] = path.read_text().splitlines()
+            source_line = file_lines[uri][start["line"]]
+            text = source_line[start["character"] : end["character"]]
+            if text == old_name:
+                name_start = start["character"]
+            elif text.endswith("." + old_name) or text == f"`{old_name}`":
+                name_start = end["character"] - len(old_name) - (1 if text.startswith("`") else 0)
+            else:
+                raise refuse(f"the reference text {text!r} at {where} is not the name (stale index, CPP, Template Haskell?)")
+            if self._hls_is_record_pun(source_line, start["character"], end["character"]):
+                raise refuse(f"the field pun at {where} would also rename the variable it binds")
+            if (uri, start["line"], name_start) in seen:
+                continue
+            seen.add((uri, start["line"], name_start))
+            changes.setdefault(uri, []).append(
+                {
+                    "range": {
+                        "start": {"line": start["line"], "character": name_start},
+                        "end": {"line": start["line"], "character": name_start + len(old_name)},
+                    },
+                    "newText": new_name,
+                }
+            )
+        log.info("Haskell rename %s -> %s: %d edits in %d files", old_name, new_name, len(seen), len(changes))
+        return {"changes": changes}
 
     def _create_base_initialize_params(self) -> dict:
         """
@@ -292,6 +580,7 @@ class HaskellLanguageServer(SolidLanguageServer):
                 "haskell": {
                     "formattingProvider": "ormolu",
                     "checkProject": True,
+                    "sessionLoading": self._hls_session_loading,
                 }
             },
             "trace": "verbose",
@@ -325,6 +614,7 @@ class HaskellLanguageServer(SolidLanguageServer):
             haskell_config = {
                 "formattingProvider": "ormolu",
                 "checkProject": True,
+                "sessionLoading": self._hls_session_loading,
                 "plugin": {"importLens": {"codeActionsOn": False, "codeLensOn": False}, "hlint": {"codeActionsOn": False}},
             }
 
@@ -344,7 +634,11 @@ class HaskellLanguageServer(SolidLanguageServer):
             return [haskell_config]
 
         self.server.on_notification("window/logMessage", window_log_message)
-        self.server.on_notification("$/progress", do_nothing)
+        # HLS reports loading and indexing as work-done progress, but only after the client accepts
+        # its window/workDoneProgress/create request; unanswered, that request fails with
+        # MethodNotFound and the waits in _hls_wait_idle would see no work at all.
+        self.server.on_request("window/workDoneProgress/create", lambda params: None)
+        self.server.on_notification("$/progress", self._on_hls_progress)
         self.server.on_notification("textDocument/publishDiagnostics", do_nothing)
         self.server.on_request("client/registerCapability", register_capability_handler)
         self.server.on_request("workspace/configuration", workspace_configuration_handler)
