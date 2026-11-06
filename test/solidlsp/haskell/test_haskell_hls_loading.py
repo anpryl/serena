@@ -24,6 +24,8 @@ def _server(component_files: Callable[[], list[str]], monkeypatch: pytest.Monkey
     ls._hls_progress_begins = 0
     ls._hls_components_lock = threading.Lock()
     ls._hls_components_loaded = False
+    ls._hls_unvisited = []
+    ls._hls_pending = None
     ls._HLS_LOAD_TIMEOUT_SECONDS = 1.0
     ls._HLS_QUERY_WAIT_SECONDS = 0.8
     ls._HLS_QUIET_SECONDS = 0.1
@@ -441,3 +443,65 @@ def test_a_file_gone_before_it_is_reopened_leaves_the_others_open(monkeypatch: p
     ls._send_references_request("gone.hs", 0, 0)
     assert opens == ["gone.hs", "b.hs", "gone.hs", "b.hs"]
     assert open_when_work_ended == [{"b.hs"}]
+
+
+def test_a_slow_component_does_not_keep_the_later_ones_unloaded(monkeypatch: pytest.MonkeyPatch) -> None:
+    ls = _server(lambda: ["a.hs", "b.hs", "c.hs"], monkeypatch)
+    opened, _ = _record_opened_files(ls)
+    answer_b = threading.Event()
+    requested: list[str] = []
+
+    def answer(relative_path: str) -> None:
+        requested.append(relative_path)
+        if relative_path == "b.hs":
+            answer_b.wait(timeout=10)
+
+    _answer_requests(ls, answer)
+    ls._ensure_hls_components_loaded()
+    assert opened == ["a.hs", "b.hs"]
+    # while b's component is still being set up, asking about c would queue a second setup
+    assert not ls._ensure_hls_components_loaded()
+    assert opened == ["a.hs", "b.hs"]
+    answer_b.set()
+    assert ls._hls_pending is not None
+    ls._hls_pending.join(timeout=5)
+    assert ls._ensure_hls_components_loaded()
+    assert opened == ["a.hs", "b.hs", "c.hs", "c.hs"], "only the file never opened, then reopened until idle"
+    assert requested == ["a.hs", "b.hs", "c.hs"]
+    assert not ls._ensure_hls_components_loaded()
+    assert opened == ["a.hs", "b.hs", "c.hs", "c.hs"]
+
+
+def test_a_request_given_up_on_is_asked_again_when_the_load_resumes(monkeypatch: pytest.MonkeyPatch) -> None:
+    ls = _server(lambda: ["a.hs", "b.hs"], monkeypatch)
+    opened, _ = _record_opened_files(ls)
+    requested: list[str] = []
+
+    def answer(relative_path: str) -> None:
+        requested.append(relative_path)
+        if requested == ["a.hs"]:
+            raise TimeoutError("Request timed out")
+
+    _answer_requests(ls, answer)
+    ls._ensure_hls_components_loaded()
+    assert opened == ["a.hs"]
+    ls._ensure_hls_components_loaded()
+    assert requested == ["a.hs", "a.hs", "b.hs"]
+
+
+def test_a_resumed_load_waits_no_longer_than_a_query(monkeypatch: pytest.MonkeyPatch) -> None:
+    ls = _server(lambda: ["a.hs", "b.hs", "c.hs"], monkeypatch)
+    ls._HLS_LOAD_TIMEOUT_SECONDS = 2.0  # far from the query wait, which bounds a resumed load
+    _record_opened_files(ls)
+    released = threading.Event()
+    _answer_requests(ls, lambda relative_path: released.wait(timeout=10) if relative_path != "a.hs" else None)
+    try:
+        ls._send_references_request("a.hs", 0, 0)
+        released.set()  # b answers; c, asked about on the next request, is slow too
+        assert ls._hls_pending is not None
+        ls._hls_pending.join(timeout=5)
+        released.clear()
+        elapsed = _timed(lambda: ls._send_references_request("a.hs", 0, 0))
+        assert ls._HLS_QUERY_WAIT_SECONDS <= elapsed < ls._HLS_QUERY_WAIT_SECONDS + 0.5
+    finally:
+        released.set()

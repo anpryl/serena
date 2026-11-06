@@ -264,6 +264,9 @@ class HaskellLanguageServer(SolidLanguageServer):
         self._hls_progress_begins = 0
         self._hls_components_lock = threading.Lock()
         self._hls_components_loaded = False
+        # components a load did not reach, and the request still running when it stopped
+        self._hls_unvisited: list[str] = []
+        self._hls_pending: threading.Thread | None = None
 
     # Upper bounds on blocking a references request: the first one, for loading every component; each one,
     # including the first, for work HLS still reports. HLS keeps working past either; references are best-effort.
@@ -315,7 +318,8 @@ class HaskellLanguageServer(SolidLanguageServer):
     def _ensure_hls_components_loaded(self) -> bool:
         """
         Once per server, opens a file of every cabal component in turn, then, with time left, all of them again
-        until HLS reports no more work.
+        until HLS reports no more work. Components not reached in time are loaded by later calls, once the
+        setup still running has finished.
 
         HLS answers references from an index of the files it has typechecked, and it typechecks a component only
         once one of its files has been opened. Without this, references from a library symbol never included
@@ -325,59 +329,79 @@ class HaskellLanguageServer(SolidLanguageServer):
         """
         with self._hls_components_lock:
             if self._hls_components_loaded:
-                return False
+                if not self._hls_unvisited or (self._hls_pending is not None and self._hls_pending.is_alive()):
+                    return False
+                # Only files never opened: opening one again would restart HLS's work on its component, such as
+                # a slow Template Haskell splice.
+                files, self._hls_unvisited = self._hls_unvisited, []
+                log.info("Loading the cabal components HLS has not reached yet by opening: %s", files)
+                self._hls_load(files, timeout_seconds=self._HLS_QUERY_WAIT_SECONDS, query_wait_seconds=0.0)
+                return True
             try:
                 files = _haskell_component_files(Path(self.repository_root_path), self.is_ignored_dirname)
             except Exception as e:  # references still work for the components that happen to be loaded
                 log.warning("Could not determine the cabal components to load into HLS: %s", e)
                 return False
-            # Once only, even if it does not finish: every file opened or closed restarts HLS's work, so
-            # trying again would abort what is still running, such as a slow Template Haskell splice.
             self._hls_components_loaded = True
             log.info("Loading every cabal component into HLS by opening: %s", files)
-            deadline = time.monotonic() + self._HLS_LOAD_TIMEOUT_SECONDS
-            # HLS sets up components one after another and reports progress for only some of them, so its
-            # silence does not mean they are loaded; its answer to a request on a file does. One request at
-            # a time: HLS answers a references request only once every component it was asked about is set
-            # up, so at the deadline at most one may still be setting up. Each file is closed once answered,
-            # since every file opened restarts HLS's work on all the open ones.
-            complete, loaded, timed_out = True, [], threading.Event()
-            for relative_path in files:
-                if time.monotonic() >= deadline or timed_out.is_set():
-                    complete = False
-                    break
-                try:
-                    with self.open_file(relative_path):
-                        request = threading.Thread(target=self._hls_request_symbols, args=(relative_path, timed_out), daemon=True)
-                        request.start()
-                        request.join(timeout=max(0.0, deadline - time.monotonic()))  # one still running is left to finish
-                except Exception as e:  # one unreadable file must not stop the other components
-                    log.warning("Could not open %s for HLS: %s", relative_path, e)
-                    continue
-                loaded.append(relative_path)
-            # With time left, the files are opened again until HLS is idle: while one of a component's files is
-            # open, HLS reports typechecking the rest of that component as progress, and once it is closed that
-            # work carries on unreported, so a wait would end before it does. The query wait is spent here too,
-            # since closing the files restarts the work being waited for, and unreported.
-            reopened = complete and not timed_out.is_set() and time.monotonic() < deadline
-            complete = reopened
-            if reopened:
-                with ExitStack() as opened:
-                    for relative_path in loaded:
-                        if time.monotonic() >= deadline:
-                            complete = False
-                            break
-                        try:
-                            opened.enter_context(self.open_file(relative_path))
-                        except Exception as e:
-                            log.warning("Could not open %s for HLS: %s", relative_path, e)
-                    with self._hls_progress_lock:
-                        self._hls_last_progress = time.monotonic()  # wait at least the quiet period after opening
-                    remaining = max(0.0, deadline - time.monotonic()) + self._HLS_QUERY_WAIT_SECONDS
-                    complete = self._hls_wait_idle(timeout_seconds=remaining) and complete
-            if not complete:
-                log.warning("HLS was still loading after %.0fs; references may be incomplete", self._HLS_LOAD_TIMEOUT_SECONDS)
-            return reopened
+            return self._hls_load(files, timeout_seconds=self._HLS_LOAD_TIMEOUT_SECONDS, query_wait_seconds=self._HLS_QUERY_WAIT_SECONDS)
+
+    def _hls_load(self, files: list[str], timeout_seconds: float, query_wait_seconds: float) -> bool:
+        """
+        Asks HLS about each file in turn until the deadline, recording what it did not reach, then reopens them
+        all until HLS is idle if time remains, for at most `query_wait_seconds` past the deadline.
+
+        :return: whether the files were reopened, so the query wait has been spent
+        """
+        deadline = time.monotonic() + timeout_seconds
+        # HLS sets up components one after another and reports progress for only some of them, so its silence
+        # does not mean they are loaded; its answer to a request on a file does. One request at a time: HLS
+        # answers a references request only once every component it was asked about is set up, so at the
+        # deadline at most one may still be setting up. Each file is closed once answered, since every file
+        # opened restarts HLS's work on all the open ones.
+        complete, loaded, timed_out, last_requested = True, [], threading.Event(), ""
+        for index, relative_path in enumerate(files):
+            if time.monotonic() >= deadline or timed_out.is_set():
+                # a request given up on is asked again first, since HLS may still be setting its component up
+                self._hls_unvisited = ([last_requested] if timed_out.is_set() else []) + files[index:]
+                complete = False
+                break
+            try:
+                with self.open_file(relative_path):
+                    request = threading.Thread(target=self._hls_request_symbols, args=(relative_path, timed_out), daemon=True)
+                    request.start()
+                    self._hls_pending, last_requested = request, relative_path
+                    request.join(timeout=max(0.0, deadline - time.monotonic()))  # one still running is left to finish
+            except Exception as e:  # one unreadable file must not stop the other components
+                log.warning("Could not open %s for HLS: %s", relative_path, e)
+                continue
+            loaded.append(relative_path)
+        if complete and timed_out.is_set():  # the last request was given up on
+            self._hls_unvisited = [last_requested]
+            complete = False
+        # With time left, the files are opened again until HLS is idle: while one of a component's files is
+        # open, HLS reports typechecking the rest of that component as progress, and once it is closed that
+        # work carries on unreported, so a wait would end before it does. The query wait is spent here too,
+        # since closing the files restarts the work being waited for, and unreported.
+        reopened = complete and time.monotonic() < deadline
+        complete = reopened
+        if reopened:
+            with ExitStack() as opened:
+                for relative_path in loaded:
+                    if time.monotonic() >= deadline:
+                        complete = False
+                        break
+                    try:
+                        opened.enter_context(self.open_file(relative_path))
+                    except Exception as e:
+                        log.warning("Could not open %s for HLS: %s", relative_path, e)
+                with self._hls_progress_lock:
+                    self._hls_last_progress = time.monotonic()  # wait at least the quiet period after opening
+                remaining = max(0.0, deadline - time.monotonic()) + query_wait_seconds
+                complete = self._hls_wait_idle(timeout_seconds=remaining) and complete
+        if not complete:
+            log.warning("HLS was still loading after %.0fs; references may be incomplete", timeout_seconds)
+        return reopened
 
     @override
     def _send_references_request(self, relative_file_path: str, line: int, column: int) -> list[lsp_types.Location] | None:
