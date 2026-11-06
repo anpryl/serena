@@ -9,7 +9,8 @@ import re
 import shutil
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -24,28 +25,36 @@ from solidlsp.settings import SolidLSPSettings
 log = logging.getLogger(__name__)
 
 # A cabal component stanza ("library", "executable foo", "test-suite foo-test", ...), a `common` stanza whose
-# fields components pull in with `import:`, and an indented field.
+# fields components pull in with `import:`, a conditional, and an indented field.
 _CABAL_COMPONENT_RE = re.compile(r"^(?:library|executable|test-suite|benchmark|foreign-library)\b", re.IGNORECASE)
 _CABAL_COMMON_RE = re.compile(r"^common\s+(\S+)", re.IGNORECASE)
+_CABAL_CONDITIONAL_RE = re.compile(r"^\s+(?:if|elif|else)\b")  # case-sensitive, unlike a module named `If`
 _CABAL_FIELD_RE = re.compile(r"^(\s+)([A-Za-z-]+)\s*:\s*(.*)$")
-_CABAL_FIELDS = ("hs-source-dirs", "main-is", "import")
+_CABAL_VALUE_RE = re.compile(r'"([^"]*)"|([^,\s]+)')
+_CABAL_FIELDS = ("hs-source-dirs", "conditional-hs-source-dirs", "main-is", "exposed-modules", "other-modules", "import")
+_HASKELL_SOURCE_SUFFIXES = (".hs", ".lhs")
 
 
 def _cabal_components(cabal_text: str) -> list[tuple[list[str], list[str]]]:
     """
-    The source directories and main modules of each component of a .cabal file. The fields of every `if`/`else`
-    branch count, since which branch is active is not known here, and so do the fields a component imports
-    from `common` stanzas.
+    The source directories of each component of a .cabal file, in the order to search them, and the files that
+    may hold its modules, main module first. The fields a component imports from `common` stanzas count.
+
+    Which `if`/`else` branch is active is not known here. Opening files from two branches makes HLS index
+    whichever it typechecks last, so the directories outside any conditional come first (`.` when there are
+    none, as when every condition is false), then the conditional ones latest first, putting `else` first.
     """
     commons: dict[str, dict[str, list[str]]] = {}
     components: list[dict[str, list[str]]] = []
     current: dict[str, list[str]] | None = None
+    conditionals: list[int] = []  # the indentation of each enclosing `if`/`else`
     lines = cabal_text.splitlines()
     for i, line in enumerate(lines):
         if not line.strip() or line.lstrip().startswith("--"):
             continue
         if not line[0].isspace():
             current = {key: [] for key in _CABAL_FIELDS}
+            conditionals = []
             if _CABAL_COMPONENT_RE.match(line):
                 components.append(current)
             elif common := _CABAL_COMMON_RE.match(line):
@@ -53,19 +62,26 @@ def _cabal_components(cabal_text: str) -> list[tuple[list[str], list[str]]]:
             else:
                 current = None  # a flag, source-repository or other stanza, or a top-level field
             continue
-        field = _CABAL_FIELD_RE.match(line)
-        if current is None or field is None or field.group(2).lower() not in current:
+        indent = len(line) - len(line.lstrip())
+        while conditionals and conditionals[-1] >= indent:
+            conditionals.pop()
+        if _CABAL_CONDITIONAL_RE.match(line):
+            conditionals.append(indent)
             continue
-        indent, value = len(field.group(1)), field.group(3)
+        field = _CABAL_FIELD_RE.match(line)
+        key = field.group(2).lower() if field else ""
+        if key == "hs-source-dirs" and conditionals:
+            key = "conditional-hs-source-dirs"
+        if current is None or field is None or key not in current:
+            continue
+        value = field.group(3)
         for continuation in lines[i + 1 :]:  # continuation lines are indented deeper and are not fields
-            if continuation.lstrip().startswith("--"):
+            if not continuation.strip() or continuation.lstrip().startswith("--"):
                 continue
-            if not continuation.strip() or len(continuation) - len(continuation.lstrip()) <= indent:
-                break
-            if _CABAL_FIELD_RE.match(continuation):
+            if len(continuation) - len(continuation.lstrip()) <= indent or _CABAL_FIELD_RE.match(continuation):
                 break
             value += " " + continuation.strip()
-        current[field.group(2).lower()] += [v.strip('"') for v in re.split(r"[,\s]+", value) if v.strip('"')]
+        current[key] += [quoted or bare for quoted, bare in _CABAL_VALUE_RE.findall(value) if quoted or bare]
 
     def collect(stanza: dict[str, list[str]], key: str, seen: frozenset[str]) -> list[str]:
         values = list(stanza[key])
@@ -74,41 +90,63 @@ def _cabal_components(cabal_text: str) -> list[tuple[list[str], list[str]]]:
                 values += collect(commons[name], key, seen | {name})
         return values
 
-    return [(collect(c, "hs-source-dirs", frozenset()) or ["."], collect(c, "main-is", frozenset())) for c in components]
+    def module_files(component: dict[str, list[str]]) -> list[str]:
+        modules = collect(component, "exposed-modules", frozenset()) + collect(component, "other-modules", frozenset())
+        return collect(component, "main-is", frozenset()) + [m.replace(".", "/") + s for m in modules for s in _HASKELL_SOURCE_SUFFIXES]
+
+    def source_dirs(component: dict[str, list[str]]) -> list[str]:
+        conditional = collect(component, "conditional-hs-source-dirs", frozenset())
+        return list(dict.fromkeys((collect(component, "hs-source-dirs", frozenset()) or ["."]) + conditional[::-1]))
+
+    return [(source_dirs(c), module_files(c)) for c in components]
 
 
 def _haskell_component_files(root: Path, is_ignored_dirname: Callable[[str], bool]) -> list[str]:
     """
-    Files that, once opened, make HLS load every component of the project: for each component of every
-    .cabal file, its main module and one source file per source directory. A package with only a package.yaml
-    gets one source file per directory next to it, and a project with neither, one per top-level directory.
+    Files that, once opened, make HLS load every component of the project. HLS typechecks a whole component
+    once one of its files is open, so one file per component of every .cabal file is enough: its main module,
+    else one of its listed modules, else the first source file in its source directories. A package with only
+    a package.yaml gets one source file per directory next to it, and a project with neither, one per
+    top-level directory.
 
     :return: paths relative to `root`, as found under it (symlinks are not resolved)
     """
 
-    def ignored(path: Path) -> bool:
-        return any(part.startswith(".") or is_ignored_dirname(part) for part in path.relative_to(root).parts[:-1])
+    def wanted(name: str) -> bool:
+        return not name.startswith(".") and not is_ignored_dirname(name)
+
+    def walk(directory: Path) -> Iterator[tuple[Path, list[str]]]:
+        for parent, dirnames, filenames in os.walk(directory):
+            dirnames[:] = sorted(d for d in dirnames if wanted(d))
+            yield Path(parent), sorted(filenames)
 
     def first_source(directory: Path) -> Path | None:
-        if not directory.is_dir():
-            return None
-        return next((p for p in sorted(directory.rglob("*.hs")) if not ignored(p)), None)
+        return next((parent / f for parent, files in walk(directory) for f in files if f.endswith(_HASKELL_SOURCE_SUFFIXES)), None)
 
     def subdirectories(directory: Path) -> list[Path]:
-        return [d for d in sorted(directory.iterdir()) if d.is_dir() and not d.name.startswith(".") and not is_ignored_dirname(d.name)]
+        return [d for d in sorted(directory.iterdir()) if d.is_dir() and wanted(d.name)]
 
+    cabal_files: list[Path] = []
+    hpack_packages: list[Path] = []
+    for parent, files in walk(root):
+        cabal_files += [parent / f for f in files if f.endswith(".cabal")]
+        if "package.yaml" in files and not any(f.endswith(".cabal") for f in files):
+            hpack_packages.append(parent)
     chosen: list[Path] = []
-    for cabal_file in sorted(root.rglob("*.cabal")):
-        if ignored(cabal_file):
-            continue
+    for cabal_file in cabal_files:
         package = cabal_file.parent
-        for source_dirs, main_modules in _cabal_components(cabal_file.read_text(errors="replace")):
-            chosen += [package / d / m for m in main_modules for d in source_dirs if (package / d / m).is_file()]
-            chosen += [f for d in source_dirs if (f := first_source(package / d)) is not None]
-    for package_yaml in sorted(root.rglob("package.yaml")):
-        package = package_yaml.parent
-        if ignored(package_yaml) or any(package.glob("*.cabal")):
+        try:
+            components = _cabal_components(cabal_file.read_text(errors="replace"))
+        except OSError as e:  # e.g. a dangling symlink; the other packages still load
+            log.warning("Could not read %s: %s", cabal_file, e)
             continue
+        for source_dirs, module_files in components:
+            directories = [package / d for d in source_dirs]
+            found = next((d / f for f in module_files for d in directories if (d / f).is_file()), None)
+            found = found or next((s for d in directories if (s := first_source(d)) is not None), None)
+            if found is not None:
+                chosen.append(found)
+    for package in hpack_packages:
         chosen += [f for d in subdirectories(package) if (f := first_source(d)) is not None]
         chosen += sorted(package.glob("*.hs"))[:1]
     if not chosen:
@@ -204,11 +242,14 @@ class HaskellLanguageServer(SolidLanguageServer):
         self._hls_progress_begins = 0
         self._hls_components_lock = threading.Lock()
         self._hls_components_loaded = False
+        self._hls_load_attempted = False
 
     # Upper bounds on blocking a references request: once for loading every component, then per request for
-    # indexing in progress (e.g. after an edit). HLS keeps indexing past either; references are best-effort.
+    # work HLS still reports. HLS keeps working past either; references are best-effort.
     _HLS_LOAD_TIMEOUT_SECONDS = 120.0
     _HLS_QUERY_WAIT_SECONDS = 30.0
+    # HLS reports nothing for about a second between finishing one piece of work and starting the next
+    _HLS_QUIET_SECONDS = 2.0
 
     @override
     def is_ignored_dirname(self, dirname: str) -> bool:
@@ -225,22 +266,28 @@ class HaskellLanguageServer(SolidLanguageServer):
                 self._hls_active_progress.discard(token)
             self._hls_last_progress = time.monotonic()
 
-    def _hls_wait_idle(self, timeout_seconds: float, quiet_seconds: float = 2.0) -> bool:
-        """Waits until HLS reports no work in progress and has been silent for `quiet_seconds`."""
+    def _hls_wait_idle(self, timeout_seconds: float) -> bool:
+        """Waits until HLS reports no work in progress and has been silent for `_HLS_QUIET_SECONDS`."""
         deadline = time.monotonic() + timeout_seconds
         while True:
             with self._hls_progress_lock:
                 busy = bool(self._hls_active_progress)
                 silent_for = time.monotonic() - self._hls_last_progress
-            if not busy and silent_for >= quiet_seconds:
+            if not busy and silent_for >= self._HLS_QUIET_SECONDS:
                 return True
             if time.monotonic() >= deadline:
                 return False
             time.sleep(0.2)
 
+    def _hls_request_symbols(self, relative_path: str) -> None:
+        try:
+            self.server.send.document_symbol({"textDocument": {"uri": self._resolve_file_uri(relative_path)}})
+        except Exception as e:  # a component HLS cannot load must not stop the others
+            log.warning("HLS could not load %s: %s", relative_path, e)
+
     def _ensure_hls_components_loaded(self) -> None:
         """
-        Opens files of every cabal component once, then waits for HLS to finish loading and indexing them.
+        Opens a file of every cabal component and keeps them open until HLS reports no more work.
 
         HLS answers references from an index of the files it has typechecked, and it typechecks a component only
         once one of its files has been opened. Without this, references from a library symbol never included
@@ -249,27 +296,40 @@ class HaskellLanguageServer(SolidLanguageServer):
         with self._hls_components_lock:
             if self._hls_components_loaded:
                 return
-            self._hls_components_loaded = True
-            deadline = time.monotonic() + self._HLS_LOAD_TIMEOUT_SECONDS
+            # A load that did not finish is resumed by later requests, each waiting no longer than a query does
+            timeout = self._HLS_QUERY_WAIT_SECONDS if self._hls_load_attempted else self._HLS_LOAD_TIMEOUT_SECONDS
+            self._hls_load_attempted = True
             try:
                 files = _haskell_component_files(Path(self.repository_root_path), self.is_ignored_dirname)
             except Exception as e:  # references still work for the components that happen to be loaded
                 log.warning("Could not determine the cabal components to load into HLS: %s", e)
                 return
             log.info("Loading every cabal component into HLS by opening: %s", files)
-            for index, relative_path in enumerate(files):
-                if time.monotonic() >= deadline:
-                    log.warning("HLS component loading exceeded %.0fs; not opening %s", self._HLS_LOAD_TIMEOUT_SECONDS, files[index:])
-                    break
-                try:
-                    with self.open_file(relative_path):
-                        self.server.send.document_symbol({"textDocument": {"uri": self._resolve_file_uri(relative_path)}})
-                except Exception as e:  # one unloadable component must not stop the others
-                    log.warning("HLS could not load %s: %s", relative_path, e)
-            with self._hls_progress_lock:
-                self._hls_last_progress = time.monotonic()  # wait at least the quiet period after the last open
-            if not self._hls_wait_idle(timeout_seconds=max(0.0, deadline - time.monotonic())):
-                log.warning("HLS is still indexing; references may be incomplete until it finishes")
+            deadline = time.monotonic() + timeout
+            # HLS loads components one after another, reporting progress for only some of them, so its
+            # silence does not mean they are loaded; its answer to a request on a file does. The files stay
+            # open until HLS is idle: while one of a component's files is open, HLS reports typechecking the
+            # rest of that component as progress, and once it is closed that work carries on unreported.
+            with ExitStack() as opened:
+                requests = []
+                for relative_path in files:
+                    try:
+                        opened.enter_context(self.open_file(relative_path))
+                    except Exception as e:  # one unreadable file must not stop the other components
+                        log.warning("Could not open %s for HLS: %s", relative_path, e)
+                        continue
+                    requests.append(threading.Thread(target=self._hls_request_symbols, args=(relative_path,), daemon=True))
+                for request in requests:
+                    request.start()
+                for request in requests:  # a request still running at the deadline is left to finish on its own
+                    request.join(timeout=max(0.0, deadline - time.monotonic()))
+                answered = not any(request.is_alive() for request in requests)
+                with self._hls_progress_lock:
+                    self._hls_last_progress = time.monotonic()  # wait at least the quiet period after the answers
+                idle = self._hls_wait_idle(timeout_seconds=max(0.0, deadline - time.monotonic()))
+                self._hls_components_loaded = answered and idle
+            if not self._hls_components_loaded:
+                log.warning("HLS was still loading after %.0fs; references may be incomplete, and the next request resumes it", timeout)
 
     @override
     def _send_references_request(self, relative_file_path: str, line: int, column: int) -> list[lsp_types.Location] | None:

@@ -42,6 +42,13 @@ def test_references_reach_the_executable_component(fresh_haskell_ls: SolidLangua
     assert ("app/Main.hs", 24) in found, f"Expected the call at app/Main.hs:25 among {sorted(found)}"
 
 
+def test_references_reach_the_test_suite_through_a_qualified_import(fresh_haskell_ls: SolidLanguageServer) -> None:
+    """test/Spec.hs, the test suite's main module, calls isPositive as H.isPositive."""
+    references = fresh_haskell_ls.request_references("src/Helper.hs", line=12, column=0)
+    found = {(Path(ref["relativePath"]).as_posix(), ref["range"]["start"]["line"]) for ref in references}
+    assert ("test/Spec.hs", 5) in found, f"Expected the call at test/Spec.hs:6 among {sorted(found)}"
+
+
 def test_hls_reported_its_loading_progress(fresh_haskell_ls: SolidLanguageServer) -> None:
     """
     The component loading waits on HLS's work-done progress, which HLS only reports once the client accepts its
