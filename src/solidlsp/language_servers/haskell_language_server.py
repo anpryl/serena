@@ -286,6 +286,9 @@ class HaskellLanguageServer(SolidLanguageServer):
             self.server.send.document_symbol({"textDocument": {"uri": self._resolve_file_uri(relative_path)}})
         except Exception as e:  # a component HLS cannot load must not stop the others
             log.warning("HLS could not load %s: %s", relative_path, e)
+            # forgotten, so that a resumed load asks again, e.g. once a build error is fixed
+            if self._hls_symbol_requests.get(relative_path) is threading.current_thread():
+                del self._hls_symbol_requests[relative_path]
 
     def _ensure_hls_components_loaded(self) -> bool:
         """
@@ -322,15 +325,17 @@ class HaskellLanguageServer(SolidLanguageServer):
                     except Exception as e:  # one unreadable file must not stop the other components
                         log.warning("Could not open %s for HLS: %s", relative_path, e)
                         continue
-                    # one request per file: a resumed load waits for the request still pending from before
-                    if relative_path not in self._hls_symbol_requests:
+                    # one request per file at a time: a resumed load waits for one still pending from before,
+                    # and one that succeeded is not repeated
+                    request = self._hls_symbol_requests.get(relative_path)
+                    if request is None:
                         request = threading.Thread(target=self._hls_request_symbols, args=(relative_path,), daemon=True)
                         self._hls_symbol_requests[relative_path] = request
                         request.start()
-                    requests.append(self._hls_symbol_requests[relative_path])
-                for request in requests:  # a request still running at the deadline is left to finish on its own
+                    requests.append((relative_path, request))
+                for _, request in requests:  # a request still running at the deadline is left to finish on its own
                     request.join(timeout=max(0.0, deadline - time.monotonic()))
-                answered = not any(request.is_alive() for request in requests)
+                answered = all(not r.is_alive() and self._hls_symbol_requests.get(p) is r for p, r in requests)
                 with self._hls_progress_lock:
                     self._hls_last_progress = time.monotonic()  # wait at least the quiet period after the answers
                 idle = self._hls_wait_idle(timeout_seconds=max(0.0, deadline - time.monotonic()))

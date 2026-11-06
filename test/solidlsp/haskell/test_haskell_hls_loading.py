@@ -4,6 +4,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 
@@ -28,7 +29,18 @@ def _server(component_files: Callable[[], list[str]], monkeypatch: pytest.Monkey
     ls._HLS_QUERY_WAIT_SECONDS = 0.3
     ls._HLS_QUIET_SECONDS = 0.1
     monkeypatch.setattr(haskell_language_server, "_haskell_component_files", lambda root, is_ignored: component_files())
+    monkeypatch.setattr(SolidLanguageServer, "_send_references_request", lambda self, *args: [])
+    _answer_requests(ls, lambda relative_path: None)
     return ls
+
+
+def _answer_requests(ls: HaskellLanguageServer, answer: Callable[[str], object]) -> None:
+    """Stands in for HLS's answer to a documentSymbol request; `answer` gets the requested file's path."""
+
+    def document_symbol(params: dict) -> object:
+        return answer(params["textDocument"]["uri"].removeprefix("file:///project/"))
+
+    ls.server = SimpleNamespace(send=SimpleNamespace(document_symbol=document_symbol))
 
 
 def _record_opened_files(ls: HaskellLanguageServer) -> tuple[list[str], set[str]]:
@@ -80,7 +92,7 @@ def test_loading_keeps_files_open_until_hls_is_idle(monkeypatch: pytest.MonkeyPa
     opened, open_now = _record_opened_files(ls)
     open_when_work_ended: list[set[str]] = []
 
-    def request_symbols(relative_path: str) -> None:
+    def answer(relative_path: str) -> None:
         # HLS answers, then goes on typechecking the rest of the component, reporting it as progress
         ls._on_hls_progress({"token": relative_path, "value": {"kind": "begin"}})
 
@@ -90,7 +102,7 @@ def test_loading_keeps_files_open_until_hls_is_idle(monkeypatch: pytest.MonkeyPa
 
         threading.Timer(0.3, finish).start()
 
-    ls._hls_request_symbols = request_symbols  # type: ignore
+    _answer_requests(ls, answer)
     ls._ensure_hls_components_loaded()
     assert ls._hls_components_loaded
     assert opened == ["a.hs", "b.hs"]
@@ -110,12 +122,12 @@ def test_loading_waits_through_the_pause_before_hls_reports_more_work(monkeypatc
         open_when_work_ended.append(set(open_now))
         ls._on_hls_progress({"token": "typecheck", "value": {"kind": "end"}})
 
-    def request_symbols(relative_path: str) -> None:
+    def answer(relative_path: str) -> None:
         # HLS answers at once, and only reports the work this starts a moment later
         threading.Timer(0.05, lambda: ls._on_hls_progress({"token": "typecheck", "value": {"kind": "begin"}})).start()
         threading.Timer(0.3, finish).start()
 
-    ls._hls_request_symbols = request_symbols  # type: ignore
+    _answer_requests(ls, answer)
     ls._ensure_hls_components_loaded()
     assert open_when_work_ended == [{"a.hs"}]
 
@@ -126,12 +138,12 @@ def test_loading_stops_at_the_deadline_and_the_next_request_resumes_it(monkeypat
     answer_b = threading.Event()
     requested: list[str] = []
 
-    def request_symbols(relative_path: str) -> None:
+    def answer(relative_path: str) -> None:
         requested.append(relative_path)
         if relative_path == "b.hs":
             answer_b.wait(timeout=10)
 
-    ls._hls_request_symbols = request_symbols  # type: ignore
+    _answer_requests(ls, answer)
     ls._HLS_LOAD_TIMEOUT_SECONDS = 1.5
     assert 1.4 <= _timed(ls._ensure_hls_components_loaded) < 2.0
     assert not ls._hls_components_loaded
@@ -144,6 +156,26 @@ def test_loading_stops_at_the_deadline_and_the_next_request_resumes_it(monkeypat
     assert ls._hls_components_loaded
     assert opened == ["a.hs", "b.hs"] * 3
     assert sorted(requested) == ["a.hs", "b.hs"], "a resumed load does not request a file again"
+
+
+def test_a_failed_request_leaves_the_load_to_be_resumed(monkeypatch: pytest.MonkeyPatch) -> None:
+    ls = _server(lambda: ["a.hs", "b.hs"], monkeypatch)
+    _record_opened_files(ls)
+    requested: list[str] = []
+    broken = {"b.hs"}
+
+    def answer(relative_path: str) -> None:
+        requested.append(relative_path)
+        if relative_path in broken:
+            raise RuntimeError("HLS could not set up the component")
+
+    _answer_requests(ls, answer)
+    ls._ensure_hls_components_loaded()
+    assert not ls._hls_components_loaded
+    broken.clear()  # e.g. the build error was fixed
+    ls._ensure_hls_components_loaded()
+    assert ls._hls_components_loaded
+    assert sorted(requested) == ["a.hs", "b.hs", "b.hs"], "only the failed request is sent again"
 
 
 def test_a_failed_discovery_is_retried(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -166,8 +198,6 @@ def test_a_failed_discovery_is_retried(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_a_references_request_waits_no_longer_than_its_bound(monkeypatch: pytest.MonkeyPatch) -> None:
     ls = _server(lambda: ["a.hs"], monkeypatch)
     _record_opened_files(ls)
-    ls._hls_request_symbols = lambda relative_path: None  # type: ignore
-    monkeypatch.setattr(SolidLanguageServer, "_send_references_request", lambda self, *args: [])
     ls._on_hls_progress({"token": "busy", "value": {"kind": "begin"}})  # every wait runs to its bound
     first = _timed(lambda: ls._send_references_request("a.hs", 0, 0))
     assert ls._HLS_LOAD_TIMEOUT_SECONDS <= first < ls._HLS_LOAD_TIMEOUT_SECONDS + 0.2
@@ -178,8 +208,6 @@ def test_a_references_request_waits_no_longer_than_its_bound(monkeypatch: pytest
 def test_a_query_after_the_load_waits_for_reported_work(monkeypatch: pytest.MonkeyPatch) -> None:
     ls = _server(lambda: ["a.hs"], monkeypatch)
     _record_opened_files(ls)
-    ls._hls_request_symbols = lambda relative_path: None  # type: ignore
-    monkeypatch.setattr(SolidLanguageServer, "_send_references_request", lambda self, *args: [])
     ls._send_references_request("a.hs", 0, 0)
     assert ls._hls_components_loaded
     ls._on_hls_progress({"token": "edit", "value": {"kind": "begin"}})
