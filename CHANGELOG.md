@@ -20,10 +20,11 @@ Status of the `main` branch. Changes prior to the next official version change w
   - Fix: Haskell references now reach the other cabal components (executables, test suites, benchmarks,
     sublibraries). HLS answers references only from components it has loaded, and it loads one only once a
     file of it is opened, so callers in `app/` or `test/` were missed unless the agent had opened one of their
-    files. Before the first reference query, Serena now opens a file of every component found in the `.cabal`
-    files (or `package.yaml`) and waits, for at most 120 s, until HLS reports no more work. The result is
-    still only as complete as HLS's index: uses of record fields can be missing, and stack projects and
-    components whose dependencies fail to build gain nothing.
+    files. Before the first reference query, Serena now opens a file of each component found in the `.cabal`
+    files (or `package.yaml`), one after another, and waits until HLS reports no more work. That happens once,
+    within 120 s plus the setup of at most one component; components not reached by then stay unloaded. The
+    result is still only as complete as HLS's index: uses of record fields can be missing, and stack projects
+    and components whose dependencies fail to build gain nothing.
   - Fix: detect Elixir installed via a Windows batch launcher
   - Extend allowed types in persisted symbol caches, fixing cache loading issues with `clangd`
     when overriding values like `ls_path`, `clangd_version` or `compile_commands_dir`
