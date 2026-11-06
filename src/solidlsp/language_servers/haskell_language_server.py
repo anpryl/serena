@@ -159,8 +159,9 @@ def _haskell_component_files(root: Path, is_ignored_dirname: Callable[[str], boo
             log.warning("Could not read %s: %s", cabal_file, e)
             continue
         for source_dirs, module_files in components:
-            # an absolute directory lies outside the project, and HLS's paths must be under the root
-            directories = [package / d for d in source_dirs if not Path(d).is_absolute()]
+            # normalised without resolving symlinks; one outside the project is skipped, as HLS's paths must be
+            # under the root
+            directories = [d for d in (Path(os.path.normpath(package / s)) for s in source_dirs) if d.is_relative_to(root)]
             # not a file another component already has: HLS would load only one of the two components for it
             listed = (d / f for f in module_files for d in directories if d / f not in chosen)
             found = next((p for p in listed if p.is_file()), None)

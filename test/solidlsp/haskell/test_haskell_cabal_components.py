@@ -44,6 +44,7 @@ foreign-library flib
         "app/Main.hs": "",
         "test/Spec.hs": "",
         "bench/Bench.hs": "",
+        "flib/Aaa.hs": "",
         "flib/FLib.hs": "",
         # packages under ignored and hidden directories, such as cabal's checkouts of source-repository-package
         "dist-newstyle/src/dep-abc/dep.cabal": dependency,
@@ -165,7 +166,8 @@ def test_unreadable_cabal_file(tmp_path: Path) -> None:
         os.symlink(tmp_path / "missing.cabal", tmp_path / "broken" / "broken.cabal")
     except OSError:
         pytest.skip("cannot create symlinks here")
-    files = {"good/good.cabal": "library\n    hs-source-dirs: src\n", "good/src/Good.hs": ""}
+    # other/ belongs to no package: it would be opened only if the broken file stopped the others
+    files = {"good/good.cabal": "library\n    hs-source-dirs: src\n", "good/src/Good.hs": "", "other/Other.hs": ""}
     assert _component_files(tmp_path, files) == {"good/src/Good.hs"}
 
 
@@ -294,16 +296,63 @@ library
 test-suite t
     type: detailed-0.9
     test-module: Tests
+    other-modules: Helpers
     hs-source-dirs: src test
 """
-    files = {"p.cabal": cabal, "src/Lib.hs": "", "test/Tests.hs": ""}
+    files = {"p.cabal": cabal, "src/Lib.hs": "", "test/Helpers.hs": "", "test/Tests.hs": ""}
     assert _component_files(tmp_path, files) == {"src/Lib.hs", "test/Tests.hs"}
 
 
-def test_absolute_source_directory(tmp_path: Path) -> None:
+@pytest.mark.parametrize("outside_dir", ["absolute", "../outside"])
+def test_source_directory_outside_the_project(tmp_path: Path, outside_dir: str) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "Gen.hs").write_text("")
     root = tmp_path / "project"
-    cabal = f"library\n    hs-source-dirs: src {outside.as_posix()}\n    exposed-modules: Gen, Lib\n"
-    assert _component_files(root, {"p.cabal": cabal, "src/Lib.hs": ""}) == {"src/Lib.hs"}
+    directory = outside.as_posix() if outside_dir == "absolute" else outside_dir
+    cabal = f"library\n    hs-source-dirs: {directory} src\n    exposed-modules: Gen, Lib\n"
+    # other/ belongs to no component: it would be opened only if the whole component were dropped
+    assert _component_files(root, {"p.cabal": cabal, "src/Lib.hs": "", "other/Other.hs": ""}) == {"src/Lib.hs"}
+
+
+def test_absolute_source_directory_inside_the_project(tmp_path: Path) -> None:
+    cabal = (
+        f"library\n    hs-source-dirs: {(tmp_path / 'src').as_posix()}\n    exposed-modules: Lib\nexecutable app\n    main-is: Main.hs\n"
+    )
+    assert _component_files(tmp_path, {"p.cabal": cabal, "src/Lib.hs": "", "Main.hs": ""}) == {"src/Lib.hs", "Main.hs"}
+
+
+def test_fallback_skips_a_file_another_component_has(tmp_path: Path) -> None:
+    files = {"p.cabal": "library\n    hs-source-dirs: src\nlibrary internal\n    hs-source-dirs: src\n", "src/A.hs": "", "src/B.hs": ""}
+    assert _component_files(tmp_path, files) == {"src/A.hs", "src/B.hs"}
+
+
+def test_elif_branches(tmp_path: Path) -> None:
+    cabal = """\
+executable app
+    main-is: Main.hs
+    if os(windows)
+        hs-source-dirs: windows
+    elif os(darwin)
+        hs-source-dirs: darwin
+    else
+        hs-source-dirs: unix
+"""
+    files = {"p.cabal": cabal, "windows/Main.hs": "", "darwin/Main.hs": "", "unix/Main.hs": ""}
+    assert _component_files(tmp_path, files) == {"unix/Main.hs"}
+
+
+def test_module_list_one_per_line_without_commas(tmp_path: Path) -> None:
+    # as hpack writes them; the first module listed is chosen, not the first file
+    cabal = "library\n    hs-source-dirs: src\n    exposed-modules:\n        Zeta\n        Alpha\n"
+    assert _component_files(tmp_path, {"p.cabal": cabal, "src/Alpha.hs": "", "src/Zeta.hs": ""}) == {"src/Zeta.hs"}
+
+
+def test_main_module_first_in_a_later_directory(tmp_path: Path) -> None:
+    cabal = "executable app\n    hs-source-dirs: src app\n    main-is: Main.hs\n    other-modules: Util\n"
+    assert _component_files(tmp_path, {"p.cabal": cabal, "src/Util.hs": "", "app/Main.hs": ""}) == {"app/Main.hs"}
+
+
+def test_common_stanza_importing_another(tmp_path: Path) -> None:
+    cabal = "common base\n    hs-source-dirs: app\ncommon exe\n    import: base\nexecutable app\n    import: exe\n    main-is: Main.hs\n"
+    assert _component_files(tmp_path, {"p.cabal": cabal, "app/Main.hs": "", "Main.hs": ""}) == {"app/Main.hs"}
