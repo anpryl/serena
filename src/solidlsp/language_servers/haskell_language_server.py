@@ -43,7 +43,8 @@ def _cabal_components(cabal_text: str) -> list[tuple[list[str], list[str]]]:
     Which `if`/`else` branch is active is not known here. Opening files from two branches makes HLS index
     whichever it typechecks last, so what lies outside any conditional, directly or through an import, comes
     first (for directories, `.` when there are none, as when every condition is false), then what lies inside
-    one, latest first, putting `else` first. The main module comes before the listed modules.
+    one, latest first, putting `else` first. The main module, the one file no other component has, comes before
+    the listed modules, wherever it is declared.
     """
     commons: dict[str, dict[str, list[str]]] = {}
     components: list[dict[str, list[str]]] = []
@@ -106,7 +107,7 @@ def _cabal_components(cabal_text: str) -> list[tuple[list[str], list[str]]]:
         def files(modules: list[str]) -> list[str]:
             return [m.replace(".", "/") + s for m in modules for s in _HASKELL_SOURCE_SUFFIXES]
 
-        return main_plain + files(exposed_plain + other_plain) + main_conditional + files(exposed_conditional + other_conditional)
+        return main_plain + main_conditional + files(exposed_plain + other_plain) + files(exposed_conditional + other_conditional)
 
     def source_dirs(component: dict[str, list[str]]) -> list[str]:
         plain, conditional = in_order(component, "hs-source-dirs")

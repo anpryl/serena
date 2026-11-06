@@ -223,3 +223,21 @@ def test_cabal_file_is_read_as_utf8(tmp_path: Path) -> None:
     (tmp_path / "tést" / "Lib.hs").write_text("")
     (tmp_path / "p.cabal").write_bytes("library\n    hs-source-dirs: tést\n".encode())
     assert _component_files(tmp_path, {}) == {"tést/Lib.hs"}
+
+
+def test_main_module_first_even_inside_a_conditional(tmp_path: Path) -> None:
+    # The main module is the one file that belongs to this component alone; Util.hs is also the library's.
+    cabal = """\
+library
+    hs-source-dirs: src
+    exposed-modules: Lib, Util
+executable app
+    hs-source-dirs: src
+    other-modules: Util
+    if os(windows)
+        main-is: WinMain.hs
+    else
+        main-is: Main.hs
+"""
+    files = {"p.cabal": cabal, "src/Lib.hs": "", "src/Util.hs": "", "src/Main.hs": "", "src/WinMain.hs": ""}
+    assert _component_files(tmp_path, files) == {"src/Lib.hs", "src/Main.hs"}
