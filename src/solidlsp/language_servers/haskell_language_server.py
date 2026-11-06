@@ -264,8 +264,8 @@ class HaskellLanguageServer(SolidLanguageServer):
         self._hls_components_lock = threading.Lock()
         self._hls_components_loaded = False
 
-    # Upper bounds on blocking a references request: the first one, for loading every component; each later
-    # one, for work HLS still reports. HLS keeps working past either; references are best-effort.
+    # Upper bounds on blocking a references request: the first one, for loading every component; each one,
+    # including the first, for work HLS still reports. HLS keeps working past either; references are best-effort.
     _HLS_LOAD_TIMEOUT_SECONDS = 120.0
     _HLS_QUERY_WAIT_SECONDS = 30.0
     # HLS reports nothing for about a second between finishing one piece of work and starting the next
@@ -309,24 +309,22 @@ class HaskellLanguageServer(SolidLanguageServer):
         except Exception as e:  # a component HLS cannot load must not stop the others
             log.warning("HLS could not load %s: %s", relative_path, e)
 
-    def _ensure_hls_components_loaded(self) -> bool:
+    def _ensure_hls_components_loaded(self) -> None:
         """
         Once per server, opens a file of every cabal component and keeps them open until HLS reports no more work.
 
         HLS answers references from an index of the files it has typechecked, and it typechecks a component only
         once one of its files has been opened. Without this, references from a library symbol never included
         callers in an executable or test suite the agent had not touched.
-
-        :return: whether this call waited for HLS, using up the time a request may wait
         """
         with self._hls_components_lock:
             if self._hls_components_loaded:
-                return False
+                return
             try:
                 files = _haskell_component_files(Path(self.repository_root_path), self.is_ignored_dirname)
             except Exception as e:  # references still work for the components that happen to be loaded
                 log.warning("Could not determine the cabal components to load into HLS: %s", e)
-                return False
+                return
             # Once only, even if it does not finish: every file opened or closed restarts HLS's work, so
             # trying again would abort what is still running, such as a slow Template Haskell splice.
             self._hls_components_loaded = True
@@ -367,12 +365,11 @@ class HaskellLanguageServer(SolidLanguageServer):
                     complete = self._hls_wait_idle(timeout_seconds=max(0.0, deadline - time.monotonic()))
             if not complete:
                 log.warning("HLS was still loading after %.0fs; references may be incomplete", self._HLS_LOAD_TIMEOUT_SECONDS)
-            return True
 
     @override
     def _send_references_request(self, relative_file_path: str, line: int, column: int) -> list[lsp_types.Location] | None:
-        if not self._ensure_hls_components_loaded():
-            self._hls_wait_idle(timeout_seconds=self._HLS_QUERY_WAIT_SECONDS)
+        self._ensure_hls_components_loaded()
+        self._hls_wait_idle(timeout_seconds=self._HLS_QUERY_WAIT_SECONDS)  # at once after a load that finished
         return super()._send_references_request(relative_file_path, line, column)
 
     def _create_base_initialize_params(self) -> dict:

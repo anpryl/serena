@@ -242,11 +242,18 @@ def test_a_references_request_waits_no_longer_than_its_bound(monkeypatch: pytest
     ls = _server(lambda: ["a.hs"], monkeypatch)
     _record_opened_files(ls)
     ls._on_hls_progress({"token": "busy", "value": {"kind": "begin"}})  # every wait runs to its bound
-    # without the bounds holding, the first request would wait a further query wait
+    # the first request: the load, then the query wait for HLS's indexing, which the deadline cut short
     first = _timed(lambda: ls._send_references_request("a.hs", 0, 0))
-    assert ls._HLS_LOAD_TIMEOUT_SECONDS <= first < ls._HLS_LOAD_TIMEOUT_SECONDS + 0.5
+    bound = ls._HLS_LOAD_TIMEOUT_SECONDS + ls._HLS_QUERY_WAIT_SECONDS
+    assert bound <= first < bound + 0.5
     later = _timed(lambda: ls._send_references_request("a.hs", 0, 0))
     assert ls._HLS_QUERY_WAIT_SECONDS <= later < ls._HLS_QUERY_WAIT_SECONDS + 0.5
+
+
+def test_a_load_that_finished_adds_no_query_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    ls = _server(lambda: ["a.hs"], monkeypatch)
+    _record_opened_files(ls)
+    assert _timed(lambda: ls._send_references_request("a.hs", 0, 0)) < ls._HLS_QUERY_WAIT_SECONDS
 
 
 def test_slow_answers_and_the_idle_wait_share_one_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
