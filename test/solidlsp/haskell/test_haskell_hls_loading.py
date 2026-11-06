@@ -26,6 +26,7 @@ def _server(component_files: Callable[[], list[str]], monkeypatch: pytest.Monkey
     ls._hls_components_loaded = False
     ls._hls_unvisited = []
     ls._hls_pending = None
+    ls._hls_given_up = None
     ls._HLS_LOAD_TIMEOUT_SECONDS = 1.0
     ls._HLS_QUERY_WAIT_SECONDS = 0.8
     ls._HLS_QUIET_SECONDS = 0.1
@@ -487,6 +488,8 @@ def test_a_request_given_up_on_is_asked_again_when_the_load_resumes(monkeypatch:
     assert opened == ["a.hs"]
     ls._ensure_hls_components_loaded()
     assert requested == ["a.hs", "a.hs", "b.hs"]
+    # a is asked about with its file left closed: reopening it would restart its component's setup
+    assert opened == ["a.hs", "b.hs", "b.hs"]
 
 
 def test_a_resumed_load_waits_no_longer_than_a_query(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -505,3 +508,29 @@ def test_a_resumed_load_waits_no_longer_than_a_query(monkeypatch: pytest.MonkeyP
         assert ls._HLS_QUERY_WAIT_SECONDS <= elapsed < ls._HLS_QUERY_WAIT_SECONDS + 0.5
     finally:
         released.set()
+
+
+def test_the_others_wait_while_a_request_asked_again_is_still_unanswered(monkeypatch: pytest.MonkeyPatch) -> None:
+    ls = _server(lambda: ["a.hs", "b.hs"], monkeypatch)
+    opened, _ = _record_opened_files(ls)
+    setup_done = threading.Event()
+    requested: list[str] = []
+
+    def answer(relative_path: str) -> None:
+        requested.append(relative_path)
+        if requested == ["a.hs"]:
+            raise TimeoutError("Request timed out")
+        if relative_path == "a.hs":
+            setup_done.wait(timeout=10)
+
+    _answer_requests(ls, answer)
+    try:
+        ls._ensure_hls_components_loaded()
+        assert ls._ensure_hls_components_loaded()  # asks about a again, which waits out the query bound
+        assert opened == ["a.hs"], "b must wait for a's setup"
+    finally:
+        setup_done.set()
+    assert ls._hls_pending is not None
+    ls._hls_pending.join(timeout=5)
+    ls._ensure_hls_components_loaded()
+    assert opened == ["a.hs", "b.hs", "b.hs"]

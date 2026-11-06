@@ -267,6 +267,7 @@ class HaskellLanguageServer(SolidLanguageServer):
         # components a load did not reach, and the request still running when it stopped
         self._hls_unvisited: list[str] = []
         self._hls_pending: threading.Thread | None = None
+        self._hls_given_up: str | None = None  # a file whose request timed out while HLS set its component up
 
     # Upper bounds on blocking a references request: the first one, for loading every component; each one,
     # including the first, for work HLS still reports. HLS keeps working past either; references are best-effort.
@@ -329,13 +330,26 @@ class HaskellLanguageServer(SolidLanguageServer):
         """
         with self._hls_components_lock:
             if self._hls_components_loaded:
-                if not self._hls_unvisited or (self._hls_pending is not None and self._hls_pending.is_alive()):
+                if not (self._hls_unvisited or self._hls_given_up) or (self._hls_pending is not None and self._hls_pending.is_alive()):
                     return False
+                deadline = time.monotonic() + self._HLS_QUERY_WAIT_SECONDS
+                if self._hls_given_up is not None:
+                    # asked again with the file left closed, as opening it would restart that component's setup;
+                    # the answer waits for the setup
+                    timed_out = threading.Event()
+                    request = threading.Thread(target=self._hls_request_symbols, args=(self._hls_given_up, timed_out), daemon=True)
+                    request.start()
+                    self._hls_pending = request
+                    request.join(timeout=max(0.0, deadline - time.monotonic()))
+                    if request.is_alive() or timed_out.is_set():
+                        return True
+                    self._hls_given_up = None
                 # Only files never opened: opening one again would restart HLS's work on its component, such as
                 # a slow Template Haskell splice.
                 files, self._hls_unvisited = self._hls_unvisited, []
-                log.info("Loading the cabal components HLS has not reached yet by opening: %s", files)
-                self._hls_load(files, timeout_seconds=self._HLS_QUERY_WAIT_SECONDS, query_wait_seconds=0.0)
+                if files:
+                    log.info("Loading the cabal components HLS has not reached yet by opening: %s", files)
+                    self._hls_load(files, timeout_seconds=max(0.0, deadline - time.monotonic()), query_wait_seconds=0.0)
                 return True
             try:
                 files = _haskell_component_files(Path(self.repository_root_path), self.is_ignored_dirname)
@@ -362,8 +376,9 @@ class HaskellLanguageServer(SolidLanguageServer):
         complete, loaded, timed_out, last_requested = True, [], threading.Event(), ""
         for index, relative_path in enumerate(files):
             if time.monotonic() >= deadline or timed_out.is_set():
-                # a request given up on is asked again first, since HLS may still be setting its component up
-                self._hls_unvisited = ([last_requested] if timed_out.is_set() else []) + files[index:]
+                if timed_out.is_set():  # HLS is still setting that component up: asked again later
+                    self._hls_given_up = last_requested
+                self._hls_unvisited = files[index:]
                 complete = False
                 break
             try:
@@ -377,7 +392,7 @@ class HaskellLanguageServer(SolidLanguageServer):
                 continue
             loaded.append(relative_path)
         if complete and timed_out.is_set():  # the last request was given up on
-            self._hls_unvisited = [last_requested]
+            self._hls_given_up = last_requested
             complete = False
         # With time left, the files are opened again until HLS is idle: while one of a component's files is
         # open, HLS reports typechecking the rest of that component as progress, and once it is closed that
