@@ -304,28 +304,33 @@ class HaskellLanguageServer(SolidLanguageServer):
                 return False
             time.sleep(min(0.2, remaining))
 
-    def _hls_request_symbols(self, relative_path: str) -> None:
+    def _hls_request_symbols(self, relative_path: str, timed_out: threading.Event) -> None:
         try:
             self.server.send.document_symbol({"textDocument": {"uri": self._resolve_file_uri(relative_path)}})
+        except TimeoutError:  # given up on, while HLS is still setting the component up
+            timed_out.set()
         except Exception as e:  # a component HLS cannot load must not stop the others
             log.warning("HLS could not load %s: %s", relative_path, e)
 
-    def _ensure_hls_components_loaded(self) -> None:
+    def _ensure_hls_components_loaded(self) -> bool:
         """
-        Once per server, opens a file of every cabal component and keeps them open until HLS reports no more work.
+        Once per server, opens a file of every cabal component in turn, then, with time left, all of them again
+        until HLS reports no more work.
 
         HLS answers references from an index of the files it has typechecked, and it typechecks a component only
         once one of its files has been opened. Without this, references from a library symbol never included
         callers in an executable or test suite the agent had not touched.
+
+        :return: whether this call already waited for work HLS reports, as long as a query would
         """
         with self._hls_components_lock:
             if self._hls_components_loaded:
-                return
+                return False
             try:
                 files = _haskell_component_files(Path(self.repository_root_path), self.is_ignored_dirname)
             except Exception as e:  # references still work for the components that happen to be loaded
                 log.warning("Could not determine the cabal components to load into HLS: %s", e)
-                return
+                return False
             # Once only, even if it does not finish: every file opened or closed restarts HLS's work, so
             # trying again would abort what is still running, such as a slow Template Haskell splice.
             self._hls_components_loaded = True
@@ -336,14 +341,14 @@ class HaskellLanguageServer(SolidLanguageServer):
             # a time: HLS answers a references request only once every component it was asked about is set
             # up, so at the deadline at most one may still be setting up. Each file is closed once answered,
             # since every file opened restarts HLS's work on all the open ones.
-            complete, loaded = True, []
+            complete, loaded, timed_out = True, [], threading.Event()
             for relative_path in files:
-                if time.monotonic() >= deadline:
+                if time.monotonic() >= deadline or timed_out.is_set():
                     complete = False
                     break
                 try:
                     with self.open_file(relative_path):
-                        request = threading.Thread(target=self._hls_request_symbols, args=(relative_path,), daemon=True)
+                        request = threading.Thread(target=self._hls_request_symbols, args=(relative_path, timed_out), daemon=True)
                         request.start()
                         request.join(timeout=max(0.0, deadline - time.monotonic()))  # one still running is left to finish
                 except Exception as e:  # one unreadable file must not stop the other components
@@ -352,25 +357,32 @@ class HaskellLanguageServer(SolidLanguageServer):
                 loaded.append(relative_path)
             # With time left, the files are opened again until HLS is idle: while one of a component's files is
             # open, HLS reports typechecking the rest of that component as progress, and once it is closed that
-            # work carries on unreported, so a wait would end before it does.
-            complete = complete and time.monotonic() < deadline
-            if complete:
+            # work carries on unreported, so a wait would end before it does. The query wait is spent here too,
+            # since closing the files restarts the work being waited for, and unreported.
+            reopened = complete and not timed_out.is_set() and time.monotonic() < deadline
+            complete = reopened
+            if reopened:
                 with ExitStack() as opened:
                     for relative_path in loaded:
+                        if time.monotonic() >= deadline:
+                            complete = False
+                            break
                         try:
                             opened.enter_context(self.open_file(relative_path))
                         except Exception as e:
                             log.warning("Could not open %s for HLS: %s", relative_path, e)
                     with self._hls_progress_lock:
                         self._hls_last_progress = time.monotonic()  # wait at least the quiet period after opening
-                    complete = self._hls_wait_idle(timeout_seconds=max(0.0, deadline - time.monotonic()))
+                    remaining = max(0.0, deadline - time.monotonic()) + self._HLS_QUERY_WAIT_SECONDS
+                    complete = self._hls_wait_idle(timeout_seconds=remaining) and complete
             if not complete:
                 log.warning("HLS was still loading after %.0fs; references may be incomplete", self._HLS_LOAD_TIMEOUT_SECONDS)
+            return reopened
 
     @override
     def _send_references_request(self, relative_file_path: str, line: int, column: int) -> list[lsp_types.Location] | None:
-        self._ensure_hls_components_loaded()
-        self._hls_wait_idle(timeout_seconds=self._HLS_QUERY_WAIT_SECONDS)  # at once after a load that finished
+        if not self._ensure_hls_components_loaded():
+            self._hls_wait_idle(timeout_seconds=self._HLS_QUERY_WAIT_SECONDS)
         return super()._send_references_request(relative_file_path, line, column)
 
     def _create_base_initialize_params(self) -> dict:

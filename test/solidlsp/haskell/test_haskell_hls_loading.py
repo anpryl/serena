@@ -3,7 +3,7 @@
 import threading
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -42,7 +42,9 @@ def _answer_requests(ls: HaskellLanguageServer, answer: Callable[[str], object])
     ls.server = SimpleNamespace(send=SimpleNamespace(document_symbol=document_symbol))
 
 
-def _record_opened_files(ls: HaskellLanguageServer, unopenable: frozenset[str] = frozenset()) -> tuple[list[str], set[str]]:
+def _record_opened_files(
+    ls: HaskellLanguageServer, unopenable: frozenset[str] = frozenset(), after_open: Callable[[list[str]], object] = lambda opened: None
+) -> tuple[list[str], set[str]]:
     """Replaces `open_file`; returns every file opened, in order, and the files open right now."""
     opened: list[str] = []
     open_now: set[str] = set()
@@ -53,6 +55,7 @@ def _record_opened_files(ls: HaskellLanguageServer, unopenable: frozenset[str] =
             raise FileNotFoundError(relative_path)
         opened.append(relative_path)
         open_now.add(relative_path)
+        after_open(opened)
         try:
             yield
         finally:
@@ -79,13 +82,14 @@ def test_wait_lasts_while_work_is_reported(token: int | str, monkeypatch: pytest
     assert ls._hls_wait_idle(timeout_seconds=1.0)
 
 
-def test_wait_lasts_for_the_quiet_period(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_quiet_period_starts_when_work_ends(monkeypatch: pytest.MonkeyPatch) -> None:
     ls = _server(list, monkeypatch)
     ls._HLS_QUIET_SECONDS = 0.4
-    ls._on_hls_progress({"token": 1, "value": {"kind": "report"}})
-    assert _timed(lambda: ls._hls_wait_idle(timeout_seconds=2.0)) >= 0.4
-    ls._on_hls_progress({"token": 1, "value": {"kind": "report"}})
-    assert not ls._hls_wait_idle(timeout_seconds=0.1)
+    for finished in ({"kind": "end"}, {"kind": "report", "percentage": 100}):
+        ls._on_hls_progress({"token": 1, "value": {"kind": "begin"}})
+        time.sleep(0.5)  # longer than the quiet period, so only the work ending can start it
+        ls._on_hls_progress({"token": 1, "value": finished})
+        assert _timed(lambda: ls._hls_wait_idle(timeout_seconds=2.0)) >= 0.4
 
 
 def test_wait_ends_when_reported_work_reaches_100_percent(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -111,23 +115,22 @@ def test_each_file_is_closed_before_the_next_is_requested(monkeypatch: pytest.Mo
 def test_loading_reopens_the_files_until_hls_is_idle(monkeypatch: pytest.MonkeyPatch) -> None:
     ls = _server(lambda: ["a.hs", "b.hs"], monkeypatch)
     ls._HLS_LOAD_TIMEOUT_SECONDS = 3.0
-    opened, open_now = _record_opened_files(ls)
     open_when_work_ended: list[set[str]] = []
 
-    def answer(relative_path: str) -> None:
-        # HLS answers, then goes on typechecking the rest of the component, reporting it as progress
-        ls._on_hls_progress({"token": relative_path, "value": {"kind": "begin"}})
+    def after_open(opened: list[str]) -> None:
+        if len(opened) == 4:  # both files reopened: HLS goes on typechecking, reporting it as progress
+            ls._on_hls_progress({"token": "typecheck", "value": {"kind": "begin"}})
 
-        def finish() -> None:
-            open_when_work_ended.append(set(open_now))
-            ls._on_hls_progress({"token": relative_path, "value": {"kind": "end"}})
+            def finish() -> None:
+                open_when_work_ended.append(set(open_now))
+                ls._on_hls_progress({"token": "typecheck", "value": {"kind": "end"}})
 
-        threading.Timer(0.3, finish).start()
+            threading.Timer(0.3, finish).start()
 
-    _answer_requests(ls, answer)
+    opened, open_now = _record_opened_files(ls, after_open=after_open)
     ls._ensure_hls_components_loaded()
     assert opened == ["a.hs", "b.hs"] * 2
-    assert open_when_work_ended == [{"a.hs", "b.hs"}] * 2
+    assert open_when_work_ended == [{"a.hs", "b.hs"}]
     assert not open_now
     ls._ensure_hls_components_loaded()
     assert opened == ["a.hs", "b.hs"] * 2, "the load is not repeated"
@@ -137,7 +140,6 @@ def test_loading_waits_through_the_pause_before_hls_reports_more_work(monkeypatc
     ls = _server(lambda: ["a.hs"], monkeypatch)
     ls._HLS_LOAD_TIMEOUT_SECONDS = 3.0
     ls._HLS_QUIET_SECONDS = 0.5  # far longer than the pause, so that a late timer cannot end the wait
-    _, open_now = _record_opened_files(ls)
     ls._hls_last_progress = time.monotonic() - 10  # HLS last reported anything long ago
     open_when_work_ended: list[set[str]] = []
 
@@ -145,12 +147,12 @@ def test_loading_waits_through_the_pause_before_hls_reports_more_work(monkeypatc
         open_when_work_ended.append(set(open_now))
         ls._on_hls_progress({"token": "typecheck", "value": {"kind": "end"}})
 
-    def answer(relative_path: str) -> None:
-        # HLS answers at once, and only reports the work this starts a moment later
-        threading.Timer(0.05, lambda: ls._on_hls_progress({"token": "typecheck", "value": {"kind": "begin"}})).start()
-        threading.Timer(1.0, finish).start()
+    def after_open(opened: list[str]) -> None:
+        if len(opened) == 2:  # reopened: HLS reports the work this starts only a moment later
+            threading.Timer(0.05, lambda: ls._on_hls_progress({"token": "typecheck", "value": {"kind": "begin"}})).start()
+            threading.Timer(1.0, finish).start()
 
-    _answer_requests(ls, answer)
+    _, open_now = _record_opened_files(ls, after_open=after_open)
     ls._ensure_hls_components_loaded()
     assert open_when_work_ended == [{"a.hs"}]
 
@@ -196,7 +198,7 @@ def test_loading_stops_at_the_deadline_and_is_not_repeated(monkeypatch: pytest.M
     assert requested == ["a.hs", "b.hs"]
 
 
-def test_a_failed_request_does_not_stop_the_other_components(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_failed_request_does_not_stop_the_other_components(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
     ls = _server(lambda: ["a.hs", "b.hs", "c.hs"], monkeypatch)
     _record_opened_files(ls)
     requested: list[str] = []
@@ -209,6 +211,7 @@ def test_a_failed_request_does_not_stop_the_other_components(monkeypatch: pytest
     _answer_requests(ls, answer)
     ls._ensure_hls_components_loaded()
     assert requested == ["a.hs", "b.hs", "c.hs"]
+    assert "HLS could not load b.hs" in caplog.text
 
 
 def test_a_file_that_cannot_be_opened_is_not_requested(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -261,7 +264,8 @@ def test_slow_answers_and_the_idle_wait_share_one_deadline(monkeypatch: pytest.M
     _record_opened_files(ls)
     _answer_requests(ls, lambda relative_path: time.sleep(0.8))
     ls._on_hls_progress({"token": "busy", "value": {"kind": "begin"}})
-    assert _timed(ls._ensure_hls_components_loaded) < ls._HLS_LOAD_TIMEOUT_SECONDS + 0.5
+    # the deadline, plus the query wait spent with the files open; not the whole bound again after the answer
+    assert _timed(ls._ensure_hls_components_loaded) < ls._HLS_LOAD_TIMEOUT_SECONDS + ls._HLS_QUERY_WAIT_SECONDS + 0.4
 
 
 def test_a_query_after_the_load_waits_for_reported_work(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -287,3 +291,153 @@ def test_a_file_gone_before_it_is_reopened_does_not_fail_the_request(monkeypatch
     ls.open_file = open_file  # type: ignore
     ls._send_references_request("a.hs", 0, 0)
     assert opens == ["a.hs", "b.hs", "a.hs", "b.hs"]
+
+
+def test_a_request_given_up_on_ends_the_load(monkeypatch: pytest.MonkeyPatch) -> None:
+    # HLS is still setting the component up, so asking about another would queue a second setup
+    ls = _server(lambda: ["a.hs", "b.hs"], monkeypatch)
+    opened, _ = _record_opened_files(ls)
+
+    def answer(relative_path: str) -> None:
+        raise TimeoutError("Request timed out")
+
+    _answer_requests(ls, answer)
+    ls._ensure_hls_components_loaded()
+    assert opened == ["a.hs"]
+
+
+def test_reopening_stops_at_the_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    ls = _server(lambda: ["a.hs", "b.hs", "c.hs"], monkeypatch)
+    opened, _ = _record_opened_files(ls, after_open=lambda opened: time.sleep(0.6) if len(opened) > 3 else None)
+    ls._ensure_hls_components_loaded()
+    assert opened == ["a.hs", "b.hs", "c.hs", "a.hs", "b.hs"]
+
+
+def test_files_stay_open_through_the_query_wait_after_the_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    # closing them at the deadline would restart the work being waited for, and HLS would not report it
+    ls = _server(lambda: ["a.hs"], monkeypatch)
+    open_when_work_ended: list[set[str]] = []
+
+    def finish() -> None:
+        open_when_work_ended.append(set(open_now))
+        ls._on_hls_progress({"token": "splice", "value": {"kind": "end"}})
+
+    def after_open(opened: list[str]) -> None:
+        if len(opened) == 2:  # reopened: work that outlasts the 1.0 s deadline but not the query wait after it
+            ls._on_hls_progress({"token": "splice", "value": {"kind": "begin"}})
+            threading.Timer(1.3, finish).start()
+
+    _, open_now = _record_opened_files(ls, after_open=after_open)
+    elapsed = _timed(lambda: ls._send_references_request("a.hs", 0, 0))
+    assert open_when_work_ended == [{"a.hs"}]
+    assert elapsed < ls._HLS_LOAD_TIMEOUT_SECONDS + ls._HLS_QUERY_WAIT_SECONDS + 0.5
+
+
+def test_the_first_query_waits_for_indexing_after_the_load(monkeypatch: pytest.MonkeyPatch) -> None:
+    ls = _server(lambda: ["a.hs"], monkeypatch)
+    _record_opened_files(ls)
+    busy_when_sent: list[bool] = []
+    monkeypatch.setattr(
+        SolidLanguageServer, "_send_references_request", lambda self, *args: busy_when_sent.append(bool(self._hls_active_progress)) or []
+    )
+
+    def answer(relative_path: str) -> None:  # indexing that outlasts the load's deadline, not the query wait
+        ls._on_hls_progress({"token": "index", "value": {"kind": "begin"}})
+        end = {"token": "index", "value": {"kind": "end"}}
+        threading.Timer(ls._HLS_LOAD_TIMEOUT_SECONDS + 0.3, lambda: ls._on_hls_progress(end)).start()
+
+    _answer_requests(ls, answer)
+    ls._send_references_request("a.hs", 0, 0)
+    assert busy_when_sent == [False]
+
+
+def test_the_query_wait_is_its_own_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    ls = _server(lambda: ["a.hs"], monkeypatch)
+    ls._HLS_QUERY_WAIT_SECONDS = 0.3
+    _record_opened_files(ls)
+    ls._send_references_request("a.hs", 0, 0)
+    ls._on_hls_progress({"token": "busy", "value": {"kind": "begin"}})
+    assert 0.3 <= _timed(lambda: ls._send_references_request("a.hs", 0, 0)) < 0.8
+
+
+def test_files_are_not_reopened_while_a_component_is_still_being_set_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    # reopening them would restart HLS's work on it
+    ls = _server(lambda: ["a.hs"], monkeypatch)
+    opened, _ = _record_opened_files(ls)
+    answered = threading.Event()
+    _answer_requests(ls, lambda relative_path: answered.wait(timeout=10))
+    ls._ensure_hls_components_loaded()
+    answered.set()
+    assert opened == ["a.hs"]
+
+
+def test_slow_answers_share_one_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    ls = _server(lambda: ["a.hs", "b.hs"], monkeypatch)
+    _record_opened_files(ls)
+    answered = threading.Event()
+    _answer_requests(ls, lambda relative_path: time.sleep(0.8) if relative_path == "a.hs" else answered.wait(timeout=10))
+    try:
+        assert _timed(ls._ensure_hls_components_loaded) < ls._HLS_LOAD_TIMEOUT_SECONDS + 0.5
+    finally:
+        answered.set()
+
+
+def test_the_load_runs_once_for_concurrent_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    def component_files() -> list[str]:
+        time.sleep(0.2)
+        return ["a.hs"]
+
+    ls = _server(component_files, monkeypatch)
+    opened, _ = _record_opened_files(ls)
+    threads = [threading.Thread(target=ls._ensure_hls_components_loaded) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert opened == ["a.hs"] * 2
+
+
+def test_a_file_that_cannot_be_opened_is_not_tried_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    ls = _server(lambda: ["a.hs", "gone.hs", "b.hs"], monkeypatch)
+    _record_opened_files(ls, unopenable=frozenset({"gone.hs"}))
+    attempts: list[str] = []
+    recording_open = ls.open_file
+
+    def open_file(relative_path: str) -> AbstractContextManager[None]:
+        attempts.append(relative_path)
+        return recording_open(relative_path)
+
+    ls.open_file = open_file  # type: ignore
+    ls._ensure_hls_components_loaded()
+    assert attempts == ["a.hs", "gone.hs", "b.hs", "a.hs", "b.hs"]
+
+
+def test_a_file_gone_before_it_is_reopened_leaves_the_others_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    ls = _server(lambda: ["gone.hs", "b.hs"], monkeypatch)
+    ls._HLS_LOAD_TIMEOUT_SECONDS = 3.0
+    opens: list[str] = []
+    open_now: set[str] = set()
+    open_when_work_ended: list[set[str]] = []
+
+    def finish() -> None:
+        open_when_work_ended.append(set(open_now))
+        ls._on_hls_progress({"token": "b", "value": {"kind": "end"}})
+
+    @contextmanager
+    def open_file(relative_path: str) -> Iterator[None]:
+        opens.append(relative_path)
+        if relative_path == "gone.hs" and opens.count("gone.hs") == 2:
+            raise FileNotFoundError(relative_path)
+        open_now.add(relative_path)
+        if relative_path == "b.hs" and opens.count("b.hs") == 2:  # reopened after the gone file failed
+            ls._on_hls_progress({"token": "b", "value": {"kind": "begin"}})
+            threading.Timer(0.3, finish).start()
+        try:
+            yield
+        finally:
+            open_now.discard(relative_path)
+
+    ls.open_file = open_file  # type: ignore
+    ls._send_references_request("gone.hs", 0, 0)
+    assert opens == ["gone.hs", "b.hs", "gone.hs", "b.hs"]
+    assert open_when_work_ended == [{"b.hs"}]
