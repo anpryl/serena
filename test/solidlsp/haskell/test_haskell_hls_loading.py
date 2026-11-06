@@ -9,6 +9,7 @@ import pytest
 
 from solidlsp.language_servers import haskell_language_server
 from solidlsp.language_servers.haskell_language_server import HaskellLanguageServer
+from solidlsp.ls import SolidLanguageServer
 
 
 def _server(component_files: Callable[[], list[str]], monkeypatch: pytest.MonkeyPatch) -> HaskellLanguageServer:
@@ -22,6 +23,7 @@ def _server(component_files: Callable[[], list[str]], monkeypatch: pytest.Monkey
     ls._hls_components_lock = threading.Lock()
     ls._hls_components_loaded = False
     ls._hls_load_attempted = False
+    ls._hls_symbol_requests = {}
     ls._HLS_LOAD_TIMEOUT_SECONDS = 0.6
     ls._HLS_QUERY_WAIT_SECONDS = 0.3
     ls._HLS_QUIET_SECONDS = 0.1
@@ -122,8 +124,10 @@ def test_loading_stops_at_the_deadline_and_the_next_request_resumes_it(monkeypat
     ls = _server(lambda: ["a.hs", "b.hs"], monkeypatch)
     opened, open_now = _record_opened_files(ls)
     answer_b = threading.Event()
+    requested: list[str] = []
 
     def request_symbols(relative_path: str) -> None:
+        requested.append(relative_path)
         if relative_path == "b.hs":
             answer_b.wait(timeout=10)
 
@@ -139,6 +143,7 @@ def test_loading_stops_at_the_deadline_and_the_next_request_resumes_it(monkeypat
     ls._ensure_hls_components_loaded()
     assert ls._hls_components_loaded
     assert opened == ["a.hs", "b.hs"] * 3
+    assert sorted(requested) == ["a.hs", "b.hs"], "a resumed load does not request a file again"
 
 
 def test_a_failed_discovery_is_retried(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -156,3 +161,26 @@ def test_a_failed_discovery_is_retried(monkeypatch: pytest.MonkeyPatch) -> None:
     ls._ensure_hls_components_loaded()
     assert ls._hls_components_loaded
     assert len(calls) == 2
+
+
+def test_a_references_request_waits_no_longer_than_its_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    ls = _server(lambda: ["a.hs"], monkeypatch)
+    _record_opened_files(ls)
+    ls._hls_request_symbols = lambda relative_path: None  # type: ignore
+    monkeypatch.setattr(SolidLanguageServer, "_send_references_request", lambda self, *args: [])
+    ls._on_hls_progress({"token": "busy", "value": {"kind": "begin"}})  # every wait runs to its bound
+    first = _timed(lambda: ls._send_references_request("a.hs", 0, 0))
+    assert ls._HLS_LOAD_TIMEOUT_SECONDS <= first < ls._HLS_LOAD_TIMEOUT_SECONDS + 0.2
+    later = _timed(lambda: ls._send_references_request("a.hs", 0, 0))
+    assert ls._HLS_QUERY_WAIT_SECONDS <= later < ls._HLS_QUERY_WAIT_SECONDS + 0.2
+
+
+def test_a_query_after_the_load_waits_for_reported_work(monkeypatch: pytest.MonkeyPatch) -> None:
+    ls = _server(lambda: ["a.hs"], monkeypatch)
+    _record_opened_files(ls)
+    ls._hls_request_symbols = lambda relative_path: None  # type: ignore
+    monkeypatch.setattr(SolidLanguageServer, "_send_references_request", lambda self, *args: [])
+    ls._send_references_request("a.hs", 0, 0)
+    assert ls._hls_components_loaded
+    ls._on_hls_progress({"token": "edit", "value": {"kind": "begin"}})
+    assert _timed(lambda: ls._send_references_request("a.hs", 0, 0)) >= ls._HLS_QUERY_WAIT_SECONDS
