@@ -23,8 +23,9 @@ Status of the `main` branch. Changes prior to the next official version change w
     files. Before the first reference query, Serena now opens a file of each component found in the `.cabal`
     files (or `package.yaml`), one after another, and waits until HLS reports no more work: for 120 s plus
     the setup of at most one component, then up to 30 s more, as every reference query does. Components not
-    reached by then are opened by later queries, once that setup has finished, within their 30 s; files
-    already opened are never reopened, as that would restart HLS's work. The result is still only as complete
+    reached by then are opened by later queries, once that setup has finished, each query waiting up to 30 s
+    plus the setup of the last component it opens; a later query never reopens a file an earlier one opened,
+    as that would restart HLS's work. The result is still only as complete
     as HLS's index: uses of record fields can be missing, and stack projects and components whose
     dependencies fail to build gain nothing.
   - Fix: detect Elixir installed via a Windows batch launcher

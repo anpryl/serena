@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from solidlsp.language_servers.haskell_language_server import _haskell_component_files
+from solidlsp.language_servers.haskell_language_server import _cabal_components, _haskell_component_files
 
 
 def _component_files(root: Path, files: dict[str, str]) -> set[str]:
@@ -356,3 +356,9 @@ def test_main_module_first_in_a_later_directory(tmp_path: Path) -> None:
 def test_common_stanza_importing_another(tmp_path: Path) -> None:
     cabal = "common base\n    hs-source-dirs: app\ncommon exe\n    import: base\nexecutable app\n    import: exe\n    main-is: Main.hs\n"
     assert _component_files(tmp_path, {"p.cabal": cabal, "app/Main.hs": "", "Main.hs": ""}) == {"app/Main.hs"}
+
+
+def test_a_continuation_line_that_looks_like_a_field() -> None:
+    # `C:` is a Windows drive, not a field named C: a line indented deeper than its field continues it
+    cabal = "library\n    hs-source-dirs:\n        C:/repo/src\n    exposed-modules: Lib\n"
+    assert _cabal_components(cabal)[0][0] == ["C:/repo/src"]

@@ -311,9 +311,10 @@ def test_a_request_given_up_on_ends_the_load(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_reopening_stops_at_the_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
     ls = _server(lambda: ["a.hs", "b.hs", "c.hs"], monkeypatch)
-    opened, _ = _record_opened_files(ls, after_open=lambda opened: time.sleep(0.6) if len(opened) > 3 else None)
+    # reopening a outlasts the whole deadline, so b and c must not be reopened however fast phase 1 was
+    opened, _ = _record_opened_files(ls, after_open=lambda opened: time.sleep(1.2) if len(opened) == 4 else None)
     ls._ensure_hls_components_loaded()
-    assert opened == ["a.hs", "b.hs", "c.hs", "a.hs", "b.hs"]
+    assert opened == ["a.hs", "b.hs", "c.hs", "a.hs"]
 
 
 def test_files_stay_open_through_the_query_wait_after_the_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -534,3 +535,48 @@ def test_the_others_wait_while_a_request_asked_again_is_still_unanswered(monkeyp
     ls._hls_pending.join(timeout=5)
     ls._ensure_hls_components_loaded()
     assert opened == ["a.hs", "b.hs", "b.hs"]
+
+
+def test_a_timeout_after_the_deadline_is_asked_again_before_the_next_component(monkeypatch: pytest.MonkeyPatch) -> None:
+    ls = _server(lambda: ["a.hs", "b.hs"], monkeypatch)
+    opened, _ = _record_opened_files(ls)
+    give_up = threading.Event()
+    requested: list[str] = []
+
+    def answer(relative_path: str) -> None:
+        requested.append(relative_path)
+        if requested == ["a.hs"]:
+            give_up.wait(timeout=10)  # still running at the deadline; the client gives up on it later
+            raise TimeoutError("Request timed out")
+
+    _answer_requests(ls, answer)
+    ls._ensure_hls_components_loaded()
+    give_up.set()
+    assert ls._hls_pending is not None
+    ls._hls_pending.join(timeout=5)
+    ls._ensure_hls_components_loaded()
+    assert requested == ["a.hs", "a.hs", "b.hs"], "a is asked again, with its file closed, before b is opened"
+    assert opened == ["a.hs", "b.hs", "b.hs"]
+
+
+def test_a_resumed_load_waits_for_reported_work(monkeypatch: pytest.MonkeyPatch) -> None:
+    ls = _server(lambda: ["a.hs"], monkeypatch)
+    _record_opened_files(ls)
+    busy_when_sent: list[bool] = []
+    monkeypatch.setattr(
+        SolidLanguageServer, "_send_references_request", lambda self, *args: busy_when_sent.append(bool(self._hls_active_progress)) or []
+    )
+    requested: list[str] = []
+
+    def answer(relative_path: str) -> None:
+        requested.append(relative_path)
+        if len(requested) == 1:
+            raise TimeoutError("Request timed out")
+        ls._on_hls_progress({"token": "index", "value": {"kind": "begin"}})  # the answer to the second ask
+        threading.Timer(0.3, lambda: ls._on_hls_progress({"token": "index", "value": {"kind": "end"}})).start()
+
+    _answer_requests(ls, answer)
+    ls._send_references_request("a.hs", 0, 0)
+    ls._send_references_request("a.hs", 0, 0)
+    assert requested == ["a.hs", "a.hs"]
+    assert busy_when_sent == [False, False]
