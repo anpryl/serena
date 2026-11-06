@@ -170,3 +170,56 @@ def test_source_directory_symlinked_from_outside_the_project(tmp_path: Path) -> 
     except OSError:
         pytest.skip("cannot create symlinks here")
     assert _component_files(root, {"p.cabal": "library\n    hs-source-dirs: src\n"}) == {"src/Lib.hs"}
+
+
+def test_conditional_imports(tmp_path: Path) -> None:
+    cabal = """\
+common win
+    hs-source-dirs: windows
+common unix
+    hs-source-dirs: unix
+executable app
+    main-is: Main.hs
+    if os(windows)
+        import: win
+    else
+        import: unix
+"""
+    files = {"p.cabal": cabal, "windows/Main.hs": "", "unix/Main.hs": ""}
+    assert _component_files(tmp_path, files) == {"unix/Main.hs"}
+
+
+def test_modules_outside_conditionals_first(tmp_path: Path) -> None:
+    cabal = """\
+library
+    hs-source-dirs: src
+    if os(windows)
+        hs-source-dirs: windows
+        exposed-modules: Windows
+    else
+        hs-source-dirs: unix
+        exposed-modules: Unix
+    exposed-modules: Shared
+"""
+    files = {"p.cabal": cabal, "src/Shared.hs": "", "windows/Windows.hs": "", "unix/Unix.hs": ""}
+    assert _component_files(tmp_path, files) == {"src/Shared.hs"}
+
+
+def test_components_listing_the_same_module_first(tmp_path: Path) -> None:
+    cabal = """\
+library
+    hs-source-dirs: src
+    exposed-modules: Common, Public
+library internal
+    hs-source-dirs: src
+    exposed-modules: Common, Internal
+"""
+    files = {"p.cabal": cabal, "src/Common.hs": "", "src/Public.hs": "", "src/Internal.hs": ""}
+    assert _component_files(tmp_path, files) == {"src/Common.hs", "src/Internal.hs"}
+
+
+def test_cabal_file_is_read_as_utf8(tmp_path: Path) -> None:
+    (tmp_path / "tést").mkdir()
+    (tmp_path / "tést" / "Lib.hs").write_text("")
+    (tmp_path / "p.cabal").write_bytes("library\n    hs-source-dirs: tést\n".encode())
+    assert _component_files(tmp_path, {}) == {"tést/Lib.hs"}

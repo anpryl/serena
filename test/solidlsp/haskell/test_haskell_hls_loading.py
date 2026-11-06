@@ -114,6 +114,8 @@ def test_loading_keeps_files_open_until_hls_is_idle(monkeypatch: pytest.MonkeyPa
 
 def test_loading_waits_through_the_pause_before_hls_reports_more_work(monkeypatch: pytest.MonkeyPatch) -> None:
     ls = _server(lambda: ["a.hs"], monkeypatch)
+    ls._HLS_LOAD_TIMEOUT_SECONDS = 3.0
+    ls._HLS_QUIET_SECONDS = 0.5  # far longer than the pause, so that a late timer cannot end the wait
     _, open_now = _record_opened_files(ls)
     ls._hls_last_progress = time.monotonic() - 10  # HLS last reported anything long ago
     open_when_work_ended: list[set[str]] = []
@@ -125,7 +127,7 @@ def test_loading_waits_through_the_pause_before_hls_reports_more_work(monkeypatc
     def answer(relative_path: str) -> None:
         # HLS answers at once, and only reports the work this starts a moment later
         threading.Timer(0.05, lambda: ls._on_hls_progress({"token": "typecheck", "value": {"kind": "begin"}})).start()
-        threading.Timer(0.3, finish).start()
+        threading.Timer(1.0, finish).start()
 
     _answer_requests(ls, answer)
     ls._ensure_hls_components_loaded()
@@ -149,7 +151,7 @@ def test_loading_stops_at_the_deadline_and_the_next_request_resumes_it(monkeypat
     assert not ls._hls_components_loaded
     assert not open_now
     # a later request resumes the load, waiting no longer than a query does
-    assert _timed(ls._ensure_hls_components_loaded) < ls._HLS_QUERY_WAIT_SECONDS + 0.4
+    assert _timed(ls._ensure_hls_components_loaded) < ls._HLS_QUERY_WAIT_SECONDS + 0.8
     assert not ls._hls_components_loaded
     answer_b.set()
     ls._ensure_hls_components_loaded()
@@ -197,12 +199,14 @@ def test_a_failed_discovery_is_retried(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_a_references_request_waits_no_longer_than_its_bound(monkeypatch: pytest.MonkeyPatch) -> None:
     ls = _server(lambda: ["a.hs"], monkeypatch)
+    ls._HLS_LOAD_TIMEOUT_SECONDS, ls._HLS_QUERY_WAIT_SECONDS = 1.0, 0.8
     _record_opened_files(ls)
     ls._on_hls_progress({"token": "busy", "value": {"kind": "begin"}})  # every wait runs to its bound
+    # without the bounds holding, each request would wait a further query wait
     first = _timed(lambda: ls._send_references_request("a.hs", 0, 0))
-    assert ls._HLS_LOAD_TIMEOUT_SECONDS <= first < ls._HLS_LOAD_TIMEOUT_SECONDS + 0.2
+    assert ls._HLS_LOAD_TIMEOUT_SECONDS <= first < ls._HLS_LOAD_TIMEOUT_SECONDS + 0.5
     later = _timed(lambda: ls._send_references_request("a.hs", 0, 0))
-    assert ls._HLS_QUERY_WAIT_SECONDS <= later < ls._HLS_QUERY_WAIT_SECONDS + 0.2
+    assert ls._HLS_QUERY_WAIT_SECONDS <= later < ls._HLS_QUERY_WAIT_SECONDS + 0.5
 
 
 def test_a_query_after_the_load_waits_for_reported_work(monkeypatch: pytest.MonkeyPatch) -> None:

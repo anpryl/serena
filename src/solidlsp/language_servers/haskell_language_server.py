@@ -31,18 +31,19 @@ _CABAL_COMMON_RE = re.compile(r"^common\s+(\S+)", re.IGNORECASE)
 _CABAL_CONDITIONAL_RE = re.compile(r"^\s+(?:if|elif|else)\b")  # case-sensitive, unlike a module named `If`
 _CABAL_FIELD_RE = re.compile(r"^(\s+)([A-Za-z-]+)\s*:\s*(.*)$")
 _CABAL_VALUE_RE = re.compile(r'"([^"]*)"|([^,\s]+)')
-_CABAL_FIELDS = ("hs-source-dirs", "conditional-hs-source-dirs", "main-is", "exposed-modules", "other-modules", "import")
+_CABAL_FIELDS = ("hs-source-dirs", "main-is", "exposed-modules", "other-modules", "import")
 _HASKELL_SOURCE_SUFFIXES = (".hs", ".lhs")
 
 
 def _cabal_components(cabal_text: str) -> list[tuple[list[str], list[str]]]:
     """
-    The source directories of each component of a .cabal file, in the order to search them, and the files that
-    may hold its modules, main module first. The fields a component imports from `common` stanzas count.
+    The source directories of each component of a .cabal file, and the files that may hold its modules, each in
+    the order to search them. The fields a component imports from `common` stanzas count.
 
     Which `if`/`else` branch is active is not known here. Opening files from two branches makes HLS index
-    whichever it typechecks last, so the directories outside any conditional come first (`.` when there are
-    none, as when every condition is false), then the conditional ones latest first, putting `else` first.
+    whichever it typechecks last, so what lies outside any conditional, directly or through an import, comes
+    first (for directories, `.` when there are none, as when every condition is false), then what lies inside
+    one, latest first, putting `else` first. The main module comes before the listed modules.
     """
     commons: dict[str, dict[str, list[str]]] = {}
     components: list[dict[str, list[str]]] = []
@@ -53,7 +54,7 @@ def _cabal_components(cabal_text: str) -> list[tuple[list[str], list[str]]]:
         if not line.strip() or line.lstrip().startswith("--"):
             continue
         if not line[0].isspace():
-            current = {key: [] for key in _CABAL_FIELDS}
+            current = {key: [] for field in _CABAL_FIELDS for key in (field, "conditional-" + field)}
             conditionals = []
             if _CABAL_COMPONENT_RE.match(line):
                 components.append(current)
@@ -70,8 +71,8 @@ def _cabal_components(cabal_text: str) -> list[tuple[list[str], list[str]]]:
             continue
         field = _CABAL_FIELD_RE.match(line)
         key = field.group(2).lower() if field else ""
-        if key == "hs-source-dirs" and conditionals:
-            key = "conditional-hs-source-dirs"
+        if conditionals:
+            key = "conditional-" + key
         if current is None or field is None or key not in current:
             continue
         value = field.group(3)
@@ -83,20 +84,33 @@ def _cabal_components(cabal_text: str) -> list[tuple[list[str], list[str]]]:
             value += " " + continuation.strip()
         current[key] += [quoted or bare for quoted, bare in _CABAL_VALUE_RE.findall(value) if quoted or bare]
 
-    def collect(stanza: dict[str, list[str]], key: str, seen: frozenset[str]) -> list[str]:
-        values = list(stanza[key])
-        for name in stanza["import"]:
+    def collect(stanza: dict[str, list[str]], field: str, seen: frozenset[str]) -> tuple[list[str], list[str]]:
+        """A field's values outside any conditional, and inside one, with those of the stanzas imported."""
+        plain, conditional = list(stanza[field]), list(stanza["conditional-" + field])
+        for name, in_conditional in [(n, False) for n in stanza["import"]] + [(n, True) for n in stanza["conditional-import"]]:
             if name in commons and name not in seen:
-                values += collect(commons[name], key, seen | {name})
-        return values
+                imported_plain, imported_conditional = collect(commons[name], field, seen | {name})
+                (conditional if in_conditional else plain).extend(imported_plain)
+                conditional += imported_conditional
+        return plain, conditional
+
+    def in_order(component: dict[str, list[str]], field: str) -> tuple[list[str], list[str]]:
+        plain, conditional = collect(component, field, frozenset())
+        return plain, conditional[::-1]
 
     def module_files(component: dict[str, list[str]]) -> list[str]:
-        modules = collect(component, "exposed-modules", frozenset()) + collect(component, "other-modules", frozenset())
-        return collect(component, "main-is", frozenset()) + [m.replace(".", "/") + s for m in modules for s in _HASKELL_SOURCE_SUFFIXES]
+        main_plain, main_conditional = in_order(component, "main-is")
+        exposed_plain, exposed_conditional = in_order(component, "exposed-modules")
+        other_plain, other_conditional = in_order(component, "other-modules")
+
+        def files(modules: list[str]) -> list[str]:
+            return [m.replace(".", "/") + s for m in modules for s in _HASKELL_SOURCE_SUFFIXES]
+
+        return main_plain + files(exposed_plain + other_plain) + main_conditional + files(exposed_conditional + other_conditional)
 
     def source_dirs(component: dict[str, list[str]]) -> list[str]:
-        conditional = collect(component, "conditional-hs-source-dirs", frozenset())
-        return list(dict.fromkeys((collect(component, "hs-source-dirs", frozenset()) or ["."]) + conditional[::-1]))
+        plain, conditional = in_order(component, "hs-source-dirs")
+        return list(dict.fromkeys((plain or ["."]) + conditional))
 
     return [(source_dirs(c), module_files(c)) for c in components]
 
@@ -136,13 +150,15 @@ def _haskell_component_files(root: Path, is_ignored_dirname: Callable[[str], boo
     for cabal_file in cabal_files:
         package = cabal_file.parent
         try:
-            components = _cabal_components(cabal_file.read_text(errors="replace"))
+            components = _cabal_components(cabal_file.read_text(encoding="utf-8", errors="replace"))
         except OSError as e:  # e.g. a dangling symlink; the other packages still load
             log.warning("Could not read %s: %s", cabal_file, e)
             continue
         for source_dirs, module_files in components:
             directories = [package / d for d in source_dirs]
-            found = next((d / f for f in module_files for d in directories if (d / f).is_file()), None)
+            # not a file another component already has: HLS would load only one of the two components for it
+            listed = (d / f for f in module_files for d in directories if d / f not in chosen)
+            found = next((p for p in listed if p.is_file()), None)
             found = found or next((s for d in directories if (s := first_source(d)) is not None), None)
             if found is not None:
                 chosen.append(found)
