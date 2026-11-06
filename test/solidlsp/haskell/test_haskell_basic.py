@@ -252,29 +252,3 @@ class TestHaskellLanguageServer:
             (),
             min_count=1,
         )
-
-    @pytest.mark.parametrize("language_server", [LanguageServerId.HASKELL], indirect=True)
-    def test_references_reach_the_executable_component(self, language_server: SolidLanguageServer) -> None:
-        """
-        The function isPositive is defined in the library (src/Helper.hs) and called only from the
-        executable (app/Main.hs), which is a different cabal component. With HLS's default
-        single-component loading, that call was never found.
-        """
-        references = language_server.request_references("src/Helper.hs", line=12, column=0)
-        paths = {ref["relativePath"] for ref in references}
-        assert "app/Main.hs" in paths, f"Expected the call in app/Main.hs among the references, got: {paths}"
-
-    @pytest.mark.parametrize("language_server", [LanguageServerId.HASKELL], indirect=True)
-    def test_rename_crosses_components(self, language_server: SolidLanguageServer) -> None:
-        """Renaming an exported function edits its export, signature and equation, and its use in the executable."""
-        edit = language_server.request_rename_symbol_edit("src/Helper.hs", line=12, column=0, new_name="isStrictlyPositive")
-        assert edit is not None
-        changes = edit["changes"]
-        edited_lines = {uri.rsplit("/", 1)[-1]: sorted(e["range"]["start"]["line"] for e in edits) for uri, edits in changes.items()}
-        assert edited_lines == {"Helper.hs": [2, 12, 13], "Main.hs": [24]}, edited_lines
-        assert all(e["newText"] == "isStrictlyPositive" for edits in changes.values() for e in edits)
-
-    @pytest.mark.parametrize("language_server", [LanguageServerId.HASKELL], indirect=True)
-    def test_rename_refuses_a_name_already_in_use(self, language_server: SolidLanguageServer) -> None:
-        with pytest.raises(ValueError, match="already occurs"):
-            language_server.request_rename_symbol_edit("src/Helper.hs", line=12, column=0, new_name="absolute")

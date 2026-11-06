@@ -17,13 +17,11 @@ Status of the `main` branch. Changes prior to the next official version change w
     if the IDE's plugin server is not reachable.
 
 * Language Servers:
-  - Fix: Haskell references and renames now reach every cabal component (library, executables, test suites).
-    With HLS's default single-component loading, they stayed inside the component of the queried file:
-    callers in `app/` or `test/` were missed, and renames of exported names were refused. Serena now loads
-    components with `sessionLoading: multipleComponents` (configurable via `ls_specific_settings`
-    `session_loading`), opens one file per component before the first reference or rename query, and builds
-    Haskell renames from the references. A rename that could be incomplete or produce invalid code is refused
-    with the reason.
+  - Fix: Haskell references now reach every cabal component (library, executables, test suites). HLS answers
+    references only from components it has loaded, and it loads one only once a file of it is opened, so
+    callers in `app/` or `test/` were missed unless the agent had opened one of their files. Before the first
+    reference query, Serena now opens files of every component found in the `.cabal` files (or `package.yaml`)
+    and waits until HLS reports that loading and indexing are done.
   - Fix: detect Elixir installed via a Windows batch launcher
   - Extend allowed types in persisted symbol caches, fixing cache loading issues with `clangd`
     when overriding values like `ls_path`, `clangd_version` or `compile_commands_dir`
