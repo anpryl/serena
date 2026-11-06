@@ -9,7 +9,7 @@ import re
 import shutil
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Collection, Iterator
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
@@ -28,10 +28,10 @@ log = logging.getLogger(__name__)
 # fields components pull in with `import:`, a conditional, and an indented field.
 _CABAL_COMPONENT_RE = re.compile(r"^(?:library|executable|test-suite|benchmark|foreign-library)\b", re.IGNORECASE)
 _CABAL_COMMON_RE = re.compile(r"^common\s+(\S+)", re.IGNORECASE)
-_CABAL_CONDITIONAL_RE = re.compile(r"^\s+(?:if|elif|else)\b")  # case-sensitive, unlike a module named `If`
+_CABAL_CONDITIONAL_RE = re.compile(r"^\s+(?:if|elif|else)\b", re.IGNORECASE)
 _CABAL_FIELD_RE = re.compile(r"^(\s+)([A-Za-z-]+)\s*:\s*(.*)$")
 _CABAL_VALUE_RE = re.compile(r'"([^"]*)"|([^,\s]+)')
-_CABAL_FIELDS = ("hs-source-dirs", "main-is", "exposed-modules", "other-modules", "import")
+_CABAL_FIELDS = ("hs-source-dirs", "main-is", "test-module", "exposed-modules", "other-modules", "import")
 _HASKELL_SOURCE_SUFFIXES = (".hs", ".lhs")
 
 
@@ -101,13 +101,15 @@ def _cabal_components(cabal_text: str) -> list[tuple[list[str], list[str]]]:
 
     def module_files(component: dict[str, list[str]]) -> list[str]:
         main_plain, main_conditional = in_order(component, "main-is")
+        test_plain, test_conditional = in_order(component, "test-module")  # a detailed-0.9 test suite's main module
         exposed_plain, exposed_conditional = in_order(component, "exposed-modules")
         other_plain, other_conditional = in_order(component, "other-modules")
 
         def files(modules: list[str]) -> list[str]:
             return [m.replace(".", "/") + s for m in modules for s in _HASKELL_SOURCE_SUFFIXES]
 
-        return main_plain + main_conditional + files(exposed_plain + other_plain) + files(exposed_conditional + other_conditional)
+        mains = main_plain + main_conditional + files(test_plain + test_conditional)
+        return mains + files(exposed_plain + other_plain) + files(exposed_conditional + other_conditional)
 
     def source_dirs(component: dict[str, list[str]]) -> list[str]:
         plain, conditional = in_order(component, "hs-source-dirs")
@@ -135,8 +137,9 @@ def _haskell_component_files(root: Path, is_ignored_dirname: Callable[[str], boo
             dirnames[:] = sorted(d for d in dirnames if wanted(d))
             yield Path(parent), sorted(filenames)
 
-    def first_source(directory: Path) -> Path | None:
-        return next((parent / f for parent, files in walk(directory) for f in files if f.endswith(_HASKELL_SOURCE_SUFFIXES)), None)
+    def first_source(directory: Path, taken: Collection[Path] = ()) -> Path | None:
+        sources = (parent / f for parent, files in walk(directory) for f in files if f.endswith(_HASKELL_SOURCE_SUFFIXES))
+        return next((p for p in sources if p not in taken), None)
 
     def subdirectories(directory: Path) -> list[Path]:
         return [d for d in sorted(directory.iterdir()) if d.is_dir() and wanted(d.name)]
@@ -156,11 +159,12 @@ def _haskell_component_files(root: Path, is_ignored_dirname: Callable[[str], boo
             log.warning("Could not read %s: %s", cabal_file, e)
             continue
         for source_dirs, module_files in components:
-            directories = [package / d for d in source_dirs]
+            # an absolute directory lies outside the project, and HLS's paths must be under the root
+            directories = [package / d for d in source_dirs if not Path(d).is_absolute()]
             # not a file another component already has: HLS would load only one of the two components for it
             listed = (d / f for f in module_files for d in directories if d / f not in chosen)
             found = next((p for p in listed if p.is_file()), None)
-            found = found or next((s for d in directories if (s := first_source(d)) is not None), None)
+            found = found or next((s for d in directories if (s := first_source(d, chosen)) is not None), None)
             if found is not None:
                 chosen.append(found)
     for package in hpack_packages:

@@ -28,6 +28,14 @@ test-suite spec
     type: exitcode-stdio-1.0
     main-is: Spec.hs
     hs-source-dirs: test
+Benchmark bench
+    type: exitcode-stdio-1.0
+    main-is: Bench.hs
+    hs-source-dirs: bench
+foreign-library flib
+    type: native-shared
+    other-modules: FLib
+    hs-source-dirs: flib
 """
     dependency = "library\n    hs-source-dirs: lib\n"
     files = {
@@ -35,6 +43,8 @@ test-suite spec
         "src/Lib.hs": "",
         "app/Main.hs": "",
         "test/Spec.hs": "",
+        "bench/Bench.hs": "",
+        "flib/FLib.hs": "",
         # packages under ignored and hidden directories, such as cabal's checkouts of source-repository-package
         "dist-newstyle/src/dep-abc/dep.cabal": dependency,
         "dist-newstyle/src/dep-abc/lib/Dep.hs": "",
@@ -43,7 +53,7 @@ test-suite spec
         ".hidden/dep.cabal": dependency,
         ".hidden/lib/Dep.hs": "",
     }
-    assert _component_files(tmp_path, files) == {"src/Lib.hs", "app/Main.hs", "test/Spec.hs"}
+    assert _component_files(tmp_path, files) == {"src/Lib.hs", "app/Main.hs", "test/Spec.hs", "bench/Bench.hs", "flib/FLib.hs"}
 
 
 def test_source_directories_imported_from_a_common_stanza(tmp_path: Path) -> None:
@@ -74,8 +84,8 @@ executable app
 
         extra
 """
-    # scripts/ belongs to no component: it would be opened only if the parsing failed and left nothing to open
-    files = {"p.cabal": cabal, "my src/Lib.hs": "", "extra/Main.hs": "", "scripts/Tool.hs": ""}
+    # Setup.hs and scripts/ belong to no component: one of them would be opened if the parsing failed
+    files = {"p.cabal": cabal, "my src/Lib.hs": "", "extra/Main.hs": "", "scripts/Tool.hs": "", "Setup.hs": ""}
     assert _component_files(tmp_path, files) == {"my src/Lib.hs", "extra/Main.hs"}
 
 
@@ -91,7 +101,7 @@ library literate
     hs-source-dirs: lit
     exposed-modules: Lit
 """
-    files = {"p.cabal": cabal, "src/Aaa.hs": "", "src/Lib/Core.hs": "", "src/Main.hs": "", "lit/Lit.lhs": ""}
+    files = {"p.cabal": cabal, "src/Aaa.hs": "", "src/Lib/Core.hs": "", "src/Main.hs": "", "lit/Aaa.hs": "", "lit/Lit.lhs": ""}
     assert _component_files(tmp_path, files) == {"src/Lib/Core.hs", "src/Main.hs", "lit/Lit.lhs"}
 
 
@@ -185,7 +195,7 @@ executable app
     else
         import: unix
 """
-    files = {"p.cabal": cabal, "windows/Main.hs": "", "unix/Main.hs": ""}
+    files = {"p.cabal": cabal, "windows/Main.hs": "", "unix/Main.hs": "", "Setup.hs": ""}
     assert _component_files(tmp_path, files) == {"unix/Main.hs"}
 
 
@@ -222,7 +232,8 @@ def test_cabal_file_is_read_as_utf8(tmp_path: Path) -> None:
     (tmp_path / "tést").mkdir()
     (tmp_path / "tést" / "Lib.hs").write_text("")
     (tmp_path / "p.cabal").write_bytes("library\n    hs-source-dirs: tést\n".encode())
-    assert _component_files(tmp_path, {}) == {"tést/Lib.hs"}
+    # other/ belongs to no component: it would be opened only if the directory name were misread
+    assert _component_files(tmp_path, {"other/Other.hs": ""}) == {"tést/Lib.hs"}
 
 
 def test_main_module_first_even_inside_a_conditional(tmp_path: Path) -> None:
@@ -241,3 +252,58 @@ executable app
 """
     files = {"p.cabal": cabal, "src/Lib.hs": "", "src/Util.hs": "", "src/Main.hs": "", "src/WinMain.hs": ""}
     assert _component_files(tmp_path, files) == {"src/Lib.hs", "src/Main.hs"}
+
+
+def test_a_field_after_a_conditional_is_outside_it(tmp_path: Path) -> None:
+    cabal = """\
+executable app
+    main-is: Main.hs
+    if os(windows)
+        ghc-options: -threaded
+    hs-source-dirs: app
+"""
+    assert _component_files(tmp_path, {"p.cabal": cabal, "Main.hs": "", "app/Main.hs": ""}) == {"app/Main.hs"}
+
+
+def test_conditional_directories_in_an_imported_common_stanza(tmp_path: Path) -> None:
+    cabal = """\
+common platform
+    if os(windows)
+        hs-source-dirs: windows
+    else
+        hs-source-dirs: unix
+executable app
+    import: platform
+    main-is: Main.hs
+"""
+    files = {"p.cabal": cabal, "windows/Main.hs": "", "unix/Main.hs": "", "Setup.hs": ""}
+    assert _component_files(tmp_path, files) == {"unix/Main.hs"}
+
+
+def test_capitalised_conditionals(tmp_path: Path) -> None:
+    cabal = "executable app\n    main-is: Main.hs\n    If os(windows)\n        hs-source-dirs: windows\n    Else\n        hs-source-dirs: unix\n"
+    files = {"p.cabal": cabal, "windows/Main.hs": "", "unix/Main.hs": ""}
+    assert _component_files(tmp_path, files) == {"unix/Main.hs"}
+
+
+def test_detailed_test_suite_sharing_the_library_directory(tmp_path: Path) -> None:
+    cabal = """\
+library
+    hs-source-dirs: src
+    exposed-modules: Lib
+test-suite t
+    type: detailed-0.9
+    test-module: Tests
+    hs-source-dirs: src test
+"""
+    files = {"p.cabal": cabal, "src/Lib.hs": "", "test/Tests.hs": ""}
+    assert _component_files(tmp_path, files) == {"src/Lib.hs", "test/Tests.hs"}
+
+
+def test_absolute_source_directory(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "Gen.hs").write_text("")
+    root = tmp_path / "project"
+    cabal = f"library\n    hs-source-dirs: src {outside.as_posix()}\n    exposed-modules: Gen, Lib\n"
+    assert _component_files(root, {"p.cabal": cabal, "src/Lib.hs": ""}) == {"src/Lib.hs"}
