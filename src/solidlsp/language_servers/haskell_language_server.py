@@ -507,8 +507,11 @@ def _haskell_uses_in(text: str, name: str, scope: _HaskellScope) -> list[tuple[i
 
     uses = []
     for start, end in _haskell_name_spans(code, name):
-        if within(not_uses, start) or (code[end : end + 1] == "." and _is_identifier_char(code[end + 1 : end + 2])):
-            continue  # a module name, or a module qualifier (T.x)
+        # a module name, or a module qualifier (T.x), which starts upper case, unlike a field in a record dot
+        # chain (c.field.inner)
+        qualifier_like = name[:1].isupper() and code[end : end + 1] == "." and _is_identifier_char(code[end + 1 : end + 2])
+        if within(not_uses, start) or (qualifier_like and not _haskell_record_dot_use(code, start)):
+            continue
         line = bisect.bisect_right(line_starts, start) - 1
         qualifier = _haskell_qualifier(code, start)
         wanted = (

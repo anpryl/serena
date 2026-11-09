@@ -254,6 +254,17 @@ def test_a_class_with_a_superclass_context_is_not_taken_for_its_superclass() -> 
     assert _uses({"src/Lib.hs": lib, "app/Use.hs": "module Use where\nimport Lib\ny = f\n"}, "f") == {("app/Use.hs", 2)}
 
 
+def test_fields_in_record_dot_chains_count() -> None:
+    """A field followed by another (c.field.inner) is not a module qualifier, which would start upper case."""
+    lib = "module Lib (Config (..), Inner (..)) where\ndata Inner = Inner {depth :: Int}\ndata Config = Config {cfgLevel :: Inner}\nf c = c.cfgLevel.depth\n"
+    use = "module Use where\nimport Lib\nh c = c.cfgLevel.depth\n"
+    assert _uses({"src/Lib.hs": lib, "app/Use.hs": use}, "cfgLevel") == {("src/Lib.hs", 3), ("app/Use.hs", 2)}
+    # nor is a value a record dot access starts from (defaultConfig.cfgLevel)
+    lib = "module Lib (Config (..), defaultConfig) where\ndata Config = Config {cfgLevel :: Int}\ndefaultConfig = Config 1\n"
+    use = "module Use where\nimport Lib\nx = defaultConfig.cfgLevel\n"
+    assert _uses({"src/Lib.hs": lib, "app/Use.hs": use}, "defaultConfig") == {("app/Use.hs", 2)}
+
+
 def test_a_module_named_like_the_type_is_not_a_use_of_it() -> None:
     sources = {
         "src/T.hs": "module T (T (..)) where\ndata T = MkT\n",
