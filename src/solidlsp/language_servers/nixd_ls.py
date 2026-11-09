@@ -634,6 +634,24 @@ class NixLanguageServer(SolidLanguageServer):
         return initialize_params
 
     @override
+    def request_definition(self, relative_file_path: str, line: int, column: int) -> list[ls_types.Location]:
+        # nixd answers a name that `with` brings into scope with that `with` keyword, as Nix looks the name up only
+        # when evaluating. Taken for a definition, it made the binding around the `with` the name's declaration.
+        definitions = super().request_definition(relative_file_path, line, column)
+        if not definitions:
+            return definitions
+        lines = self.retrieve_full_file_content(relative_file_path).split("\n")
+
+        def is_with_keyword(location: ls_types.Location) -> bool:
+            start, end = location["range"]["start"], location["range"]["end"]
+            if location.get("relativePath") != relative_file_path or start["line"] != end["line"] or start["line"] >= len(lines):
+                return False
+            text = lines[start["line"]]
+            return text[_utf16_column_to_index(text, start["character"]) : _utf16_column_to_index(text, end["character"])] == "with"
+
+        return [definition for definition in definitions if not is_with_keyword(definition)]
+
+    @override
     def _request_hover(self, file_buffer: LSPFileBuffer, line: int, column: int) -> ls_types.Hover | None:
         """Retry an empty hover while nixd finishes its initial analysis.
 

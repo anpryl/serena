@@ -400,3 +400,17 @@ class TestNixLanguageServer:
         # merged by nixd: two statements under `services.web`, `between` inside `piece`, `whole.extra` after `whole`,
         # `outer.inner.b` after `outer`, below a segment inside it, and `late.added` after `late = { };`
         assert refused == {"services", "services/web", "piece", "whole", "outer", "outer/inner", "late"}
+
+    @pytest.mark.parametrize("language_server", [LanguageServerId.NIX], indirect=True)
+    def test_a_name_from_with_has_no_declaration(self, language_server: SolidLanguageServer) -> None:
+        """
+        For `quad` in `scoped = with helpers; quad 2;`, nixd answers with the `with` keyword, which Serena took for
+        the declaration's location, so `scoped` was reported as declaring `quad`.
+        """
+        content = read_repo_file(language_server, "with.nix")
+        name = find_text_coordinates(content, r"with helpers; (quad) 2;", require_unique=True)
+        subject = find_text_coordinates(content, r"with (helpers);", require_unique=True)
+        assert name is not None and subject is not None
+        assert language_server.request_defining_symbol("with.nix", name.line, name.col) is None
+        defining_subject = language_server.request_defining_symbol("with.nix", subject.line, subject.col)
+        assert defining_subject is not None and defining_subject["name"] == "helpers"
