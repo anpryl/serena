@@ -15,6 +15,7 @@ import platform
 import re
 import shutil
 import subprocess
+from collections import Counter
 from collections.abc import Hashable
 from copy import deepcopy
 from pathlib import Path
@@ -251,9 +252,40 @@ class NixLanguageServer(SolidLanguageServer):
 
         return symbol
 
+    # nixd's document symbols are its syntax tree: an attribute (Field, `let` bindings included) or a lambda
+    # (Function) is a definition, but every variable use (Constant, Variable, Event, Boolean, Null), attribute
+    # name in a selection (Property), literal (String, Number) and list (Array) is a symbol too. Taken as symbols,
+    # uses share the names of what they use, so `find_symbol` of a binding matched its uses as well; and a use
+    # starts where nixd's reference to it starts, so `find_referencing_symbols` took each reference for the symbol
+    # itself and dropped it.
+    _NIX_DEFINITION_KINDS = frozenset({ls_types.SymbolKind.Field, ls_types.SymbolKind.Function})
+
+    @classmethod
+    def _nix_definitions(cls, symbols: list[ls_types.UnifiedSymbolInformation]) -> list[ls_types.UnifiedSymbolInformation]:
+        """
+        The definitions among nixd's symbols, each with only definitions below it. A definition inside a dropped
+        symbol, such as an attribute set in a list, takes the dropped symbol's place.
+        """
+        definitions = []
+        for symbol in symbols:
+            children = cls._nix_definitions(symbol.get("children") or [])
+            if symbol.get("kind") in cls._NIX_DEFINITION_KINDS:
+                definitions.append({**symbol, "children": children})
+            else:
+                definitions.extend(children)
+        # the overload indices were given among nixd's siblings, uses and lifted definitions included
+        counts = Counter(symbol["name"] for symbol in definitions)
+        seen: Counter[str] = Counter()
+        for symbol in definitions:
+            symbol.pop("overload_idx", None)
+            if counts[symbol["name"]] > 1:
+                symbol["overload_idx"] = seen[symbol["name"]]
+            seen[symbol["name"]] += 1
+        return definitions
+
     @override
     def _document_symbols_cache_fingerprint(self) -> Hashable | None:
-        build_document_symbols_version = 4
+        build_document_symbols_version = 5
         return build_document_symbols_version
 
     @override
@@ -288,9 +320,11 @@ class NixLanguageServer(SolidLanguageServer):
 
         # Apply range extension to all symbols
         try:
-            extended_root_symbols = [extend_symbol_and_children(sym) for sym in document_symbols.root_symbols]
+            extended_root_symbols = [extend_symbol_and_children(sym) for sym in self._nix_definitions(document_symbols.root_symbols)]
         finally:
             _utf16_offsets.cache_clear()  # its tables are several times their lines' size
+        for root in extended_root_symbols:  # a definition lifted out of a dropped symbol would still name it
+            root["parent"] = None
 
         return DocumentSymbols(extended_root_symbols)
 

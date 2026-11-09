@@ -12,6 +12,7 @@ import pytest
 from solidlsp.language_servers.nixd_ls import NixLanguageServer, _utf16_column_to_index, _utf16_offsets
 from solidlsp.ls import DocumentSymbols, SolidLanguageServer
 from solidlsp.ls_config import LanguageServerConfig, LanguageServerId
+from solidlsp.ls_types import SymbolKind
 from solidlsp.settings import SolidLSPSettings
 
 
@@ -325,7 +326,9 @@ def test_document_symbols_of_a_long_line_are_built_quickly(monkeypatch: pytest.M
         column = index + 1  # the astral character before it takes two UTF-16 units
         range_ = {"start": {"line": 0, "character": column}, "end": {"line": 0, "character": column + len(binding)}}
         selection = {"start": range_["start"], "end": {"line": 0, "character": column + len(name)}}
-        symbols.append({"name": name, "range": range_, "selectionRange": selection, "location": {"range": range_}})
+        symbols.append(
+            {"name": name, "kind": SymbolKind.Field, "range": range_, "selectionRange": selection, "location": {"range": range_}}
+        )
         pieces.append(binding + "; ")
         index += len(binding) + 2
     line = "".join(pieces) + "}"
@@ -339,3 +342,74 @@ def test_document_symbols_of_a_long_line_are_built_quickly(monkeypatch: pytest.M
     assert time.monotonic() - started < 1.0
     assert len({id(symbol["body"]._lines) for symbol in result.root_symbols}) == 1, "one copy of the lines per document"
     assert _utf16_offsets.cache_info().currsize == 0, "the line's offsets table is not kept after the build"
+
+
+def _node(name: str, kind: SymbolKind, *children: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    """A nixd-style symbol with just what the definitions filter looks at."""
+    return {"name": name, "kind": kind, "children": list(children), **extra}
+
+
+def _names(symbols: list[dict[str, Any]]) -> list[Any]:
+    return [
+        (s["name"], s.get("overload_idx"), _names(s["children"])) if s["children"] else (s["name"], s.get("overload_idx")) for s in symbols
+    ]
+
+
+def test_only_definitions_are_kept_as_symbols() -> None:
+    """
+    The tree nixd sends has every node of the syntax tree: for `{ inherit greet; six = double 3; ids = [ { id = 1; } ]; }`
+    the uses `greet` and `double`, the literals and the list are symbols too, and only the attributes and
+    lambdas are definitions. An attribute set inside the list takes the list's place.
+    """
+    tree = [
+        _node("greet", SymbolKind.Field, _node("greet", SymbolKind.Constant)),
+        _node("six", SymbolKind.Field, _node("double", SymbolKind.Constant), _node("3", SymbolKind.Number)),
+        _node(
+            "ids", SymbolKind.Field, _node("{anonymous}", SymbolKind.Array, _node("id", SymbolKind.Field, _node("1", SymbolKind.Number)))
+        ),
+        _node("f", SymbolKind.Field, _node("x", SymbolKind.Function, _node("x", SymbolKind.Constant), _node("builtins", SymbolKind.Event))),
+        _node(
+            "on", SymbolKind.Field, _node("true", SymbolKind.Boolean), _node("enable", SymbolKind.Property), _node("null", SymbolKind.Null)
+        ),
+        _node("s", SymbolKind.Field, _node("(dynamic string)", SymbolKind.String), _node("v", SymbolKind.Variable)),
+    ]
+    assert _names(NixLanguageServer._nix_definitions(tree)) == [
+        ("greet", None),
+        ("six", None),
+        ("ids", None, [("id", None)]),
+        ("f", None, [("x", None)]),
+        ("on", None),
+        ("s", None),
+    ]
+
+
+def test_overload_indices_are_given_among_definitions() -> None:
+    """
+    A use that shared a definition's name gave it an index ([1] with no [0] once the use is gone), and two
+    definitions lifted out of lists became siblings without telling them apart.
+    """
+    tree = [
+        _node("double", SymbolKind.Constant, overload_idx=0),
+        _node("double", SymbolKind.Field, overload_idx=1),
+        _node("{anonymous}", SymbolKind.Array, _node("item", SymbolKind.Field)),
+        _node("{anonymous}", SymbolKind.Array, _node("item", SymbolKind.Field)),
+    ]
+    assert _names(NixLanguageServer._nix_definitions(tree)) == [("double", None), ("item", 0), ("item", 1)]
+
+
+def test_the_built_tree_has_only_definitions_with_their_parents(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = "[ { id = 1; } ]"
+    lines = source.split("\n")
+    item = {**_symbol_for(source, "id = 1", "id"), "name": "id", "kind": SymbolKind.Field, "children": [], "location": {"range": None}}
+    item["location"]["range"] = item["range"]
+    listed = {**_symbol_for(source, source, "["), "name": "{anonymous}", "kind": SymbolKind.Array, "children": [item]}
+    listed["location"] = {"range": listed["range"]}
+    item["parent"] = listed
+    buffer = Mock(contents=source, split_lines=lambda: lines)
+    monkeypatch.setattr(
+        SolidLanguageServer, "_build_document_symbols_from_raw_symbols", lambda self, path, file_buffer: DocumentSymbols([listed])
+    )
+    ls = NixLanguageServer.__new__(NixLanguageServer)
+    roots = ls._build_document_symbols_from_raw_symbols("list.nix", buffer).root_symbols
+    assert [(r["name"], r["parent"]) for r in roots] == [("id", None)]
+    assert roots[0]["body"].get_text() == "id = 1;"

@@ -334,3 +334,25 @@ class TestNixLanguageServer:
             assert inner in bodies, f"{inner!r} should be a symbol without the binding's semicolon"
         # a range ending at the end of its line, with the semicolon on the next one
         assert "nextLine = 1" in bodies
+
+    @pytest.mark.parametrize("language_server", [LanguageServerId.NIX], indirect=True)
+    def test_symbols_are_definitions_only(self, language_server: SolidLanguageServer) -> None:
+        """
+        The tree nixd sends lists uses of variables, attribute names in selections, literals and lists too, so a
+        binding's name was shared by its uses: listUtils matched its uses as well as its two definitions, the
+        `let` binding and `inherit listUtils`.
+        """
+        all_symbols, _ = language_server.request_document_symbols("default.nix").get_all_symbols_and_roots()
+        assert {s["kind"] for s in all_symbols} <= {SymbolKind.Field, SymbolKind.Function}
+        assert [s["kind"] for s in all_symbols if s["name"] == "listUtils"] == [SymbolKind.Field, SymbolKind.Field]
+
+    @pytest.mark.parametrize("language_server", [LanguageServerId.NIX], indirect=True)
+    def test_referencing_symbols_reach_uses_in_the_same_file(self, language_server: SolidLanguageServer) -> None:
+        """
+        The binding listUtils (line 16) is used inside `average` (line 22) and inherited (line 67). nixd returns both,
+        but each use was a symbol starting where its reference starts, so Serena dropped them as the symbol itself.
+        """
+        references = language_server.request_referencing_symbols(
+            "default.nix", 15, 2, include_imports=False, include_self=False, include_file_symbols=True
+        )
+        assert {21, 66} <= {reference.line for reference in references}
