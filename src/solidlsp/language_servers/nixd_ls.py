@@ -258,19 +258,24 @@ class NixLanguageServer(SolidLanguageServer):
     # uses share the names of what they use, so `find_symbol` of a binding matched its uses as well; and a use
     # starts where nixd's reference to it starts, so `find_referencing_symbols` took each reference for the symbol
     # itself and dropped it.
+    # A lambda without an `@` name is `(anonymous lambda)`: nearly every module and package file is one, which hid
+    # the file's bindings below it in the overview and put `(anonymous lambda)/` in front of every name path.
     _NIX_DEFINITION_KINDS = frozenset({ls_types.SymbolKind.Field, ls_types.SymbolKind.Function})
+    _NIX_ANONYMOUS_LAMBDA = "(anonymous lambda)"
 
     @classmethod
     def _nix_definitions(cls, symbols: list[ls_types.UnifiedSymbolInformation]) -> list[ls_types.UnifiedSymbolInformation]:
         """
         The definitions among nixd's symbols, each with only definitions below it. A definition inside a dropped
-        symbol, such as an attribute set in a list, takes the dropped symbol's place.
+        symbol, such as an attribute set in a list or the body of an anonymous lambda, takes the dropped symbol's
+        place. Each is marked as structure: a Field's kind would leave it out of overviews.
         """
         definitions = []
         for symbol in symbols:
             children = cls._nix_definitions(symbol.get("children") or [])
-            if symbol.get("kind") in cls._NIX_DEFINITION_KINDS:
-                definitions.append({**symbol, "children": children})
+            anonymous_lambda = symbol.get("kind") == ls_types.SymbolKind.Function and symbol["name"] == cls._NIX_ANONYMOUS_LAMBDA
+            if symbol.get("kind") in cls._NIX_DEFINITION_KINDS and not anonymous_lambda:
+                definitions.append({**symbol, "children": children, "low_level": False})
             else:
                 definitions.extend(children)
         # the overload indices were given among nixd's siblings, uses and lifted definitions included
@@ -285,7 +290,7 @@ class NixLanguageServer(SolidLanguageServer):
 
     @override
     def _document_symbols_cache_fingerprint(self) -> Hashable | None:
-        build_document_symbols_version = 5
+        build_document_symbols_version = 6
         return build_document_symbols_version
 
     @override

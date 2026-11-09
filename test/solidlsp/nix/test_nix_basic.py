@@ -6,6 +6,7 @@ These tests validate symbol finding and cross-file reference capabilities for Ni
 
 import pytest
 
+from serena.symbol import LanguageServerSymbol
 from serena.util.text_utils import find_text_coordinates
 from solidlsp import SolidLanguageServer
 from solidlsp.ls_config import LanguageServerId
@@ -320,6 +321,8 @@ class TestNixLanguageServer:
             "lambda = x: x;",
             "formals = { a }: { b = a; };",
             "b = a;",
+            "atFormals = args@{ a }: { c = a; };",
+            "c = a;",
             "compare = y: y == 1;",
             '${"dynamic"} = 5;',
             "lineComment # before the equals sign\n    = 6;",
@@ -329,8 +332,9 @@ class TestNixLanguageServer:
             "e = 5;",
         }
         bodies = {s["body"].get_text() for s in all_symbols}
-        # lambdas inside bindings, including ones whose text contains `=`, and inherited names
-        for inner in ["x: x", "{ a }: { b = a; }", "y: y == 1", "toString"]:
+        # lambdas inside bindings, including ones whose text contains `=`, and inherited names; an anonymous lambda
+        # (`{ a }: { b = a; }`) is no symbol, its bindings taking its place
+        for inner in ["x: x", "args@{ a }: { c = a; }", "y: y == 1", "toString"]:
             assert inner in bodies, f"{inner!r} should be a symbol without the binding's semicolon"
         # a range ending at the end of its line, with the semicolon on the next one
         assert "nextLine = 1" in bodies
@@ -356,3 +360,18 @@ class TestNixLanguageServer:
             "default.nix", 15, 2, include_imports=False, include_self=False, include_file_symbols=True
         )
         assert {21, 66} <= {reference.line for reference in references}
+
+    @pytest.mark.parametrize("language_server", [LanguageServerId.NIX], indirect=True)
+    def test_overview_of_a_file_level_function(self, language_server: SolidLanguageServer) -> None:
+        """
+        lib/utils.nix is a function, `{ lib }: rec { ... }`, as nearly every module and package file is. Its overview
+        showed only `(anonymous lambda)`, the bindings below it, and left out attributes, being Fields, at any depth.
+        """
+        roots = [LanguageServerSymbol(s) for s in language_server.request_document_overview("lib/utils.nix")]
+        assert {r.name for r in roots} == {"math", "strings", "lists", "attrs", "files", "validate"}
+        math = next(r for r in roots if r.name == "math").to_dict(depth=1, child_inclusion_predicate=lambda s: not s.is_low_level())
+        assert {"math/factorial", "math/fibonacci", "math/isPrime", "math/gcd"} <= {c["name_path"] for c in math["children"]}
+
+    @pytest.mark.parametrize("language_server", [LanguageServerId.NIX], indirect=True)
+    def test_no_name_path_goes_through_an_anonymous_lambda(self, language_server: SolidLanguageServer) -> None:
+        assert [s["name"] for s in request_all_symbols(language_server) if s["name"] == "(anonymous lambda)"] == []

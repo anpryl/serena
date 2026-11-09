@@ -519,6 +519,8 @@ def test_nix_binding_body_written_back_unchanged():
         "services/web/hosts/web-host",
         "lambda",
         "formals",
+        "formals/b",
+        "atFormals",
         "compare",
         "lineComment",
         "blockComment",

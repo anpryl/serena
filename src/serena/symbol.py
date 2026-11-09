@@ -249,6 +249,9 @@ class LanguageServerSymbol(Symbol, ToStringMixin):
         :return: whether the symbol is a low-level symbol (variable, constant, etc.), which typically represents data
             rather than structure and therefore is not relevant in a high-level overview of the code.
         """
+        low_level = self.symbol_root.get("low_level")
+        if low_level is not None:  # the language server's judgement, where kinds mean something else
+            return low_level
         return not SymbolKind.is_container(self.symbol_kind)
 
     @property

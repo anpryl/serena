@@ -9,6 +9,7 @@
   services.web.hosts."web-host" = { root = "/srv"; };
   lambda = x: x;
   formals = { a }: { b = a; };
+  atFormals = args@{ a }: { c = a; };
   compare = y: y == 1;
   ${"dynamic"} = 5;
   lineComment # before the equals sign

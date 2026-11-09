@@ -236,6 +236,13 @@ class UnifiedSymbolInformation(TypedDict):
     Added for Serena, not part of the LSP.
     """
 
+    low_level: NotRequired[bool]
+    """
+    Whether the symbol is low-level data, which overviews leave out, rather than structure. Set by a language server
+    whose kinds mislead here, as nixd's do: every Nix attribute is a Field, a low-level kind, yet attributes are the
+    structure of a Nix file. Omitted, the kind decides. Added for Serena, not part of the LSP.
+    """
+
 
 class MarkupKind(Enum):
     """Describes the content type that a client supports in various

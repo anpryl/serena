@@ -9,6 +9,7 @@ from unittest.mock import Mock, call, patch
 
 import pytest
 
+from serena.symbol import LanguageServerSymbol
 from solidlsp.language_servers.nixd_ls import NixLanguageServer, _utf16_column_to_index, _utf16_offsets
 from solidlsp.ls import DocumentSymbols, SolidLanguageServer
 from solidlsp.ls_config import LanguageServerConfig, LanguageServerId
@@ -395,6 +396,39 @@ def test_overload_indices_are_given_among_definitions() -> None:
         _node("{anonymous}", SymbolKind.Array, _node("item", SymbolKind.Field)),
     ]
     assert _names(NixLanguageServer._nix_definitions(tree)) == [("double", None), ("item", 0), ("item", 1)]
+
+
+def test_anonymous_lambdas_give_their_place_to_their_bindings() -> None:
+    """
+    A file-level function such as `{ lib }: rec { math = { ... }; }` is an anonymous lambda in nixd's tree, so the
+    file's bindings were below it and every name path began with `(anonymous lambda)/`; a binding whose value is
+    such a function had the lambda between it and its attributes. A lambda with a name stays.
+    """
+    tree = [
+        _node(
+            "(anonymous lambda)",
+            SymbolKind.Function,
+            _node("lib", SymbolKind.Constant),
+            _node("math", SymbolKind.Field, _node("factorial", SymbolKind.Field, _node("n", SymbolKind.Function))),
+            _node("outputs", SymbolKind.Field, _node("(anonymous lambda)", SymbolKind.Function, _node("lib", SymbolKind.Field))),
+            _node("withArgs", SymbolKind.Field, _node("args", SymbolKind.Function, _node("a", SymbolKind.Field))),
+            # a quoted attribute may carry the same name
+            _node("(anonymous lambda)", SymbolKind.Field, _node("1", SymbolKind.Number)),
+        )
+    ]
+    assert _names(NixLanguageServer._nix_definitions(tree)) == [
+        ("math", None, [("factorial", None, [("n", None)])]),
+        ("outputs", None, [("lib", None)]),
+        ("withArgs", None, [("args", None, [("a", None)])]),
+        ("(anonymous lambda)", None),
+    ]
+
+
+def test_definitions_are_structure_in_overviews() -> None:
+    """Overviews leave out low-level children, and a Field's kind is low-level, so an attribute set showed no attributes."""
+    settings = NixLanguageServer._nix_definitions([_node("settings", SymbolKind.Field, _node("level", SymbolKind.Field))])[0]
+    assert not LanguageServerSymbol(settings).is_low_level()
+    assert not LanguageServerSymbol(settings["children"][0]).is_low_level()
 
 
 def test_the_built_tree_has_only_definitions_with_their_parents(monkeypatch: pytest.MonkeyPatch) -> None:
