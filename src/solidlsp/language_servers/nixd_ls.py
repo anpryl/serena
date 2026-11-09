@@ -28,6 +28,7 @@ from solidlsp import ls_types
 from solidlsp.dependency_provider import LanguageServerDependencyProvider, LanguageServerDependencyProviderSinglePath
 from solidlsp.ls import DocumentSymbols, LSPFileBuffer, SolidLanguageServer, SymbolBodyFactory
 from solidlsp.ls_config import LanguageServerConfig
+from solidlsp.ls_exceptions import SolidLSPException
 from solidlsp.settings import SolidLSPSettings
 from solidlsp.util.subprocess_util import subprocess_run
 
@@ -632,6 +633,23 @@ class NixLanguageServer(SolidLanguageServer):
             "initializationOptions": deepcopy(self._nixd_settings),
         }
         return initialize_params
+
+    @override
+    def request_references_incompleteness(self, relative_file_path: str, line: int, column: int) -> str | None:
+        # nixd finds an attribute's references in its own file only, and renames only a variable whose uses it all sees:
+        # one that `let` or a function binds (a `rec` attribute it refuses). Preparing a rename is how it tells them apart.
+        with self.open_file(relative_file_path):
+            try:
+                prepared = self.server.send.prepare_rename(
+                    {"textDocument": {"uri": self._resolve_file_uri(relative_file_path)}, "position": {"line": line, "character": column}}
+                )
+            except SolidLSPException as e:
+                prepared, reason = None, f" ({e.cause or e})"
+            else:
+                reason = ""
+        if prepared is None:
+            return f"nixd finds the references of an attribute only in its own file, and this is no variable it can rename{reason}"
+        return None
 
     @override
     def request_definition(self, relative_file_path: str, line: int, column: int) -> list[ls_types.Location]:

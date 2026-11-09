@@ -1836,6 +1836,13 @@ class SolidLanguageServer(ABC):
                 unique_files,
             )
 
+    def request_references_incompleteness(self, relative_file_path: str, line: int, column: int) -> str | None:
+        """
+        :return: why `request_references` may miss references to the symbol at the given position, if it may, so that
+            a deletion judged safe by them could break their users; None where the server finds them all
+        """
+        return None
+
     def request_references(self, relative_file_path: str, line: int, column: int) -> list[ls_types.Location]:
         """
         Raise a [textDocument/references](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_references) request to the Language Server

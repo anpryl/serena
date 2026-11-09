@@ -791,6 +791,9 @@ class LspApi(FacadeApi):
             f"Symbol {name_path_pattern} has no identifier position, this is likely a bug."
         )
         lang_server = symbol_retriever.get_language_server(symbol_rel_path)
+        incompleteness = lang_server.request_references_incompleteness(symbol_rel_path, symbol_line, symbol_col)
+        if incompleteness is not None:
+            return f"Cannot delete the symbol {symbol_name_path} safely: {incompleteness}"
         references_locations = lang_server.request_references(symbol_rel_path, symbol_line, symbol_col)
         file_to_lines: dict[str, list[int]] = defaultdict(list)
         for ref_loc in references_locations or []:

@@ -414,3 +414,17 @@ class TestNixLanguageServer:
         assert language_server.request_defining_symbol("with.nix", name.line, name.col) is None
         defining_subject = language_server.request_defining_symbol("with.nix", subject.line, subject.col)
         assert defining_subject is not None and defining_subject["name"] == "helpers"
+
+    @pytest.mark.parametrize("language_server", [LanguageServerId.NIX], indirect=True)
+    def test_references_of_an_attribute_may_be_incomplete(self, language_server: SolidLanguageServer) -> None:
+        """
+        An attribute's references are found by nixd in its own file only, so a safe_delete trusting them deleted
+        `helpers.triple` of a library that another file selects. A `let` variable's references it finds whole.
+        """
+        content = read_repo_file(language_server, "safe_delete.nix")
+        variable = find_text_coordinates(content, r"^  (unused) = 1;", require_unique=True)
+        attribute = find_text_coordinates(content, r"^  (value) = used;", require_unique=True)
+        assert variable is not None and attribute is not None
+        assert language_server.request_references_incompleteness("safe_delete.nix", variable.line, variable.col) is None
+        incompleteness = language_server.request_references_incompleteness("safe_delete.nix", attribute.line, attribute.col)
+        assert incompleteness is not None and "only in its own file" in incompleteness

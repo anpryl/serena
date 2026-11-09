@@ -2,11 +2,13 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import copy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, cast
 
 import pytest
@@ -40,6 +42,7 @@ from serena.tools import (
 from solidlsp.ls_config import LanguageServerId
 from solidlsp.ls_types import SymbolKind
 from test.conftest import (
+    agent_for_project_context,
     find_identifier_pos,
     get_pytest_markers,
     get_repo_path,
@@ -1433,6 +1436,25 @@ class TestSerenaAgent:
             assert case.name_path not in file_content, (
                 f"Expected symbol {case.name_path} to be removed from {case.relative_path}, but it still appears in the file content"
             )
+
+
+@pytest.mark.nix
+@pytest.mark.skipif(not language_server_tests_enabled(LanguageServerId.NIX), reason="Nix tests are disabled (nixd not available)")
+def test_nix_safe_delete_trusts_nixd_only_for_variables(tmp_path: Path) -> None:
+    """
+    An attribute's references are found by nixd in its own file only: with references for attributes, a safe_delete
+    of one used only from another file deleted it. A `let` variable is deleted when unused and kept when used.
+    """
+    repo = tmp_path / "repo"
+    shutil.copytree(get_repo_path(LanguageServerId.NIX), repo)
+    with agent_for_project_context(LanguageServerId.NIX, str(repo)) as agent:
+        safe_delete_tool = agent.get_tool(SafeDeleteSymbol)
+        result = safe_delete_tool.apply(name_path_pattern="value", relative_path="safe_delete.nix")
+        assert "Cannot delete the symbol value safely" in result and "only in its own file" in result
+        assert "referenced in" in safe_delete_tool.apply(name_path_pattern="used", relative_path="safe_delete.nix")
+        assert safe_delete_tool.apply(name_path_pattern="unused", relative_path="safe_delete.nix") == SUCCESS_RESULT
+    assert "unused" not in (repo / "safe_delete.nix").read_text()
+    assert "value = used;" in (repo / "safe_delete.nix").read_text()
 
 
 class TestPromptProvision:
