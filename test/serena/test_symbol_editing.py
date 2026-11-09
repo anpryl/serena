@@ -10,7 +10,7 @@ import sys
 import tempfile
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -558,6 +558,140 @@ def test_nix_binding_replaced_in_shown_shape():
         [(name, new_body) for name, _, new_body in edits],
         replacements=[(old_body, new_body) for _, old_body, new_body in edits],
     ).run_test(None)
+
+
+@pytest.mark.nix
+@pytest.mark.skipif(not language_server_tests_enabled(LanguageServerId.NIX), reason="Nix tests are disabled (nixd not available)")
+def test_nix_dotted_key_written_back_and_replaced():
+    """Each segment of a path in one statement is written back unchanged, and replaced in the shape shown."""
+    name_paths = ["single/path", "single/path/only", "spread", "spread/over", "services/web/enable", "piece/a", "whole/inner"]
+    NixBindingEditTest("dotted.nix", [(name, None) for name in name_paths], replacements=[]).run_test(None)
+    NixBindingEditTest(
+        "dotted.nix",
+        [("single", "single.path.only = 10;"), ("piece/b", "b = 30;")],
+        replacements=[("single.path.only = 1;", "single.path.only = 10;"), ("piece.b = 3;", "piece.b = 30;")],
+    ).run_test(None)
+
+
+class NixRefusedEditTest(EditingTest):
+    """An edit the editor must refuse, leaving the file unchanged."""
+
+    def __init__(self, rel_path: str, edit: Callable[[CodeEditor], None], reason: str):
+        super().__init__(LanguageServerId.NIX, rel_path)
+        self.edit = edit
+        self.reason = reason
+
+    def _apply_edit(self, code_editor: CodeEditor) -> None:
+        with pytest.raises(ValueError, match=self.reason):
+            self.edit(code_editor)
+
+    @overrides
+    def _test_diff(self, code_diff: CodeDiff, snapshot: SnapshotAssertion | None) -> None:
+        assert not code_diff.has_changes
+
+
+@pytest.mark.nix
+@pytest.mark.skipif(not language_server_tests_enabled(LanguageServerId.NIX), reason="Nix tests are disabled (nixd not available)")
+@pytest.mark.parametrize(
+    ("edit", "reason"),
+    [
+        (lambda editor: editor.replace_body("services", "dotted.nix", "services.web.enable = false;"), "more than one statement"),
+        (lambda editor: editor.replace_body("services/web", "dotted.nix", "web.enable = false;"), "more than one statement"),
+        (lambda editor: editor.replace_body("piece", "dotted.nix", "piece.a = 10;"), "more than one statement"),
+        (lambda editor: editor.replace_body("whole", "dotted.nix", "whole = { inner = 10; };"), "more than one statement"),
+        (lambda editor: editor.replace_body("outer", "dotted.nix", "outer = 0;"), "more than one statement"),
+        (lambda editor: editor.delete_symbol("piece", "dotted.nix"), "more than one statement"),
+        # deleting `path` of `single.path.only = 1;` left `single.` to take the next binding
+        (lambda editor: editor.delete_symbol("single/path", "dotted.nix"), "continues the attribute path"),
+        (lambda editor: editor.delete_symbol("piece/a", "dotted.nix"), "continues the attribute path"),
+        # `lines` of `spread.over` + newline + `.lines = 2;` is on the path's second line
+        (lambda editor: editor.insert_before_symbol("spread/over/lines", "dotted.nix", "added = 1;"), "continues an attribute path"),
+        # `leaf` shares its line with `across`, but the path begins at `broken.` on the line above
+        (lambda editor: editor.insert_before_symbol("broken/across/leaf", "dotted.nix", "added = 1;"), "continues an attribute path"),
+        # `added` of `late.` + newline + `added = 1;` begins its line, inside the path; deleting it left `late.`
+        (lambda editor: editor.insert_before_symbol("late/added", "dotted.nix", "x = 1;"), "continues an attribute path"),
+        (lambda editor: editor.delete_symbol("late/added", "dotted.nix"), "continues the attribute path"),
+        (lambda editor: editor.replace_body("late", "dotted.nix", "late = 0;"), "more than one statement"),
+        # after `first.b = 1;` comes `other = {` on the same line, so the next line is inside `other`
+        (lambda editor: editor.insert_after_symbol("first", "dotted.nix", "x = 1;"), "does not end its line"),
+        (lambda editor: editor.insert_before_symbol("other", "dotted.nix", "x = 1;"), "does not begin its line"),
+        (lambda editor: editor.insert_after_symbol("inline/member", "dotted.nix", "x = 1;"), "does not end its line"),
+        (lambda editor: editor.insert_before_symbol("inline/member", "dotted.nix", "x = 1;"), "does not begin its line"),
+        # `/* first */ commentOther = { /* second */` is no comment: a comment ends at its own `*/`
+        (lambda editor: editor.insert_after_symbol("commentA", "dotted.nix", "x = 1;"), "does not end its line"),
+    ],
+)
+def test_nix_edit_that_would_break_an_attribute_path_is_refused(edit: Callable[[CodeEditor], None], reason: str):
+    """
+    Statements that share a prefix are one attribute in nixd's tree: `piece` covers only its name, and `whole` only
+    its first statement. Replacing either wrote over part of a statement, or left `whole.extra` to clash.
+    """
+    NixRefusedEditTest("dotted.nix", edit, reason).run_test(None)
+
+
+@pytest.mark.nix
+@pytest.mark.skipif(not language_server_tests_enabled(LanguageServerId.NIX), reason="Nix tests are disabled (nixd not available)")
+@pytest.mark.parametrize(
+    ("edit", "reason"),
+    [
+        # deleting the lambda of `lambda = x: x;` left `lambda = ;`
+        (lambda editor: editor.delete_symbol("lambda/x", "bindings.nix"), "not a whole binding"),
+        # `w: w;` begins its line, but code before it went into `wrapped =`
+        (lambda editor: editor.insert_before_symbol("wrapped/w", "bindings.nix", "added = 1;"), "not a whole binding"),
+        (lambda editor: editor.insert_before_symbol("toString", "bindings.nix", "added = 1;"), "not a whole binding"),
+        # `nextLine = 1` ends its line, but its `;` is on the next one
+        (lambda editor: editor.insert_after_symbol("nextLine", "bindings.nix", "added = 1;"), "does not end with the `;`"),
+    ],
+)
+def test_nix_part_of_a_binding_is_not_edited_alone(edit: Callable[[CodeEditor], None], reason: str):
+    NixRefusedEditTest("bindings.nix", edit, reason).run_test(None)
+
+
+@pytest.mark.nix
+@pytest.mark.skipif(not language_server_tests_enabled(LanguageServerId.NIX), reason="Nix tests are disabled (nixd not available)")
+@pytest.mark.parametrize(
+    "edit",
+    [
+        # four characters outside the Basic Multilingual Plane before its end: the editor's range took `afterFamily`'s
+        # binding too
+        lambda editor: editor.replace_body("family", "astral.nix", 'family = "x";'),
+        lambda editor: editor.delete_symbol("afterFamily", "astral.nix"),
+        lambda editor: editor.replace_body("inline/y", "astral.nix", "y = 3;"),
+        # a segment's range ends where its binding's does, past the same characters
+        lambda editor: editor.replace_body("emojiPath", "astral.nix", 'emojiPath.key = "x";'),
+    ],
+)
+def test_nix_symbol_after_an_astral_character_is_not_edited_whole(edit: Callable[[CodeEditor], None]):
+    NixRefusedEditTest("astral.nix", edit, "outside the Basic Multilingual Plane").run_test(None)
+
+
+class NixInsertTest(EditingTest):
+    def __init__(self, name_path: str, before: bool, after_text: str):
+        super().__init__(LanguageServerId.NIX, "dotted.nix")
+        self.name_path, self.before, self.after_text = name_path, before, after_text
+
+    def _apply_edit(self, code_editor: CodeEditor) -> None:
+        insert = code_editor.insert_before_symbol if self.before else code_editor.insert_after_symbol
+        insert(self.name_path, self.rel_path, "  added = 1;")
+
+    @overrides
+    def _test_diff(self, code_diff: CodeDiff, snapshot: SnapshotAssertion | None) -> None:
+        assert code_diff.modified_content == code_diff.original_content.replace(self.after_text, self.after_text + "  added = 1;\n")
+
+
+@pytest.mark.nix
+@pytest.mark.skipif(not language_server_tests_enabled(LanguageServerId.NIX), reason="Nix tests are disabled (nixd not available)")
+@pytest.mark.parametrize(
+    ("name_path", "before", "after_text"),
+    [
+        ("services", True, "    .lines = 2;\n"),
+        ("single/path", False, "  single.path.only = 1;\n"),
+        ("other", False, "other = {\n    child = 2;\n  };\n"),
+    ],
+)
+def test_nix_insert_next_to_an_attribute_path(name_path: str, before: bool, after_text: str):
+    """Inserting before a path's first segment, or after any segment of a statement ending its line, goes between statements."""
+    NixInsertTest(name_path, before, after_text).run_test(None)
 
 
 # A single `type` declaration body that re-supplies the leading `type` keyword, as a user would

@@ -5,4 +5,6 @@
   next = 1;
   inline = { x = "🚀"; y = 2; };
   last = { z = "🚀";};
+  family = "👨‍👩‍👧‍👦";afterFamily = 1;
+  emojiPath.key = "👨‍👩‍👧‍👦";
 }

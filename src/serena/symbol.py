@@ -129,6 +129,13 @@ class Symbol(ToStringMixin, ABC):
             previous/next definition by at least one empty line.
         """
 
+    def get_edit_refusal(self, edit: Literal["replace_body", "delete", "insert_before", "insert_after"]) -> str | None:
+        """
+        :param edit: the edit of the symbol
+        :return: why the edit would break the file, if it would
+        """
+        return None
+
 
 class NamePathComponent:
     def __init__(self, name: str, overload_idx: int | None = None) -> None:
@@ -257,6 +264,9 @@ class LanguageServerSymbol(Symbol, ToStringMixin):
     @property
     def overload_idx(self) -> int | None:
         return self.symbol_root.get("overload_idx")
+
+    def get_edit_refusal(self, edit: Literal["replace_body", "delete", "insert_before", "insert_after"]) -> str | None:
+        return self.symbol_root.get("edit_refusals", {}).get(edit)
 
     def is_neighbouring_definition_separated_by_empty_line(self) -> bool:
         return self.symbol_kind in (SymbolKind.Function, SymbolKind.Method, SymbolKind.Class, SymbolKind.Interface, SymbolKind.Struct)

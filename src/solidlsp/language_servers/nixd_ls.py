@@ -38,6 +38,9 @@ log = logging.getLogger(__name__)
 # an `=` written inside it, or let `/* */` run past its own end, and made long comments take exponential time.
 # nixd puts a binding's range on the last component of an attribute path, so no path follows the name.
 _NIX_BINDING_TAIL = re.compile(r"(?>(?:\s|#[^\n]*|/\*.*?\*/)*)=(?!=)", re.DOTALL)
+# what may follow a binding that ends its line: whitespace and comments
+_NIX_LINE_END = re.compile(r"(?:\s|#.*|/\*(?:[^*]|\*(?!/))*\*/)*")
+_NIX_INDENT = re.compile(r"\s*")
 
 
 @functools.lru_cache(maxsize=16)
@@ -288,9 +291,142 @@ class NixLanguageServer(SolidLanguageServer):
             seen[symbol["name"]] += 1
         return definitions
 
+    @classmethod
+    def _is_nix_range_shifted(cls, symbol: ls_types.UnifiedSymbolInformation, edited: ls_types.Range, lines: list[str]) -> bool:
+        """
+        Whether Serena's editor, which takes columns as string indices, would edit other text than the symbol's: LSP
+        counts UTF-16 units, two for a character outside the Basic Multilingual Plane. One such character before a
+        binding's end still lands on its `;`, which the range then does not take; more, or one before its start, do not.
+        """
+        start, end = symbol["range"]["start"], symbol["range"]["end"]
+        if end["line"] >= len(lines):
+            return False
+        start_line, end_line = lines[start["line"]], lines[end["line"]]
+        if start_line.isascii() and end_line.isascii():
+            return False
+        true_start = _utf16_column_to_index(start_line, start["character"])
+        true_end = _utf16_column_to_index(end_line, end["character"])
+        if cls._is_nix_binding(symbol, lines) and end_line[true_end : true_end + 1] == ";":
+            true_end += 1
+        return (edited["start"]["character"], edited["end"]["character"]) != (true_start, true_end)
+
+    @classmethod
+    def _join_attrpath_segments(
+        cls,
+        symbol: ls_types.UnifiedSymbolInformation,
+        body_factory: SymbolBodyFactory,
+        lines: list[str],
+        path_start: ls_types.UnifiedSymbolInformation | None = None,
+    ) -> tuple[tuple[int, int], bool]:
+        """
+        Gives each segment of a dotted key the statement it begins, and refuses the edits that would break the file.
+
+        nixd gives the segments of an attribute path before its last only their name: in `a.b.c = 1;`, `a` covers
+        `a`, so a new `a.b.c = 2;` replaced the name alone. A segment with one child now ends where its child does:
+        `a` covers `a.b.c = 1;` and `b` covers `b.c = 1;`. nixd merges the statements that share a prefix, so
+        `x.a = 1; y = 2; x.b = 3;` has one `x` and `z = { }; z.extra = 2;` one `z`, and neither has a single body.
+        A later statement that adds no attribute (`x.a = 1; x = { };`) leaves no trace in the tree, and goes unseen.
+
+        Serena deletes a symbol's range and inserts at the line before or after it, which is right only for a whole
+        statement on lines of its own: deleting `b` of `a.b = 1;` leaves `a.` to take the next binding, deleting
+        `x: x` of `f = x: x;` leaves `f = ;`, and inserting after `a = 1;` in `a = 1; b = {` lands inside `b`.
+
+        :param path_start: the first segment of the attribute path that the symbol continues, if it continues one
+        :return: the end of the last statement defining the symbol, as (line, character), and whether the editor's
+            columns are shifted from the symbol's text
+        """
+        shifted = symbol.pop("_nix_shifted", False)
+        children = symbol.get("children") or []
+        symbol_range = symbol["range"]
+        end = (symbol_range["end"]["line"], symbol_range["end"]["character"])
+        starts_after = [(c["range"]["start"]["line"], c["range"]["start"]["character"]) >= end for c in children]
+        name_only = symbol_range == symbol.get("selectionRange")
+        # nixd also lists the attributes of `inherit ({ x = 1; }) x;`'s set below the name, before it
+        is_segment = bool(children) and name_only and all(starts_after)
+        child_results = [
+            # a child after a binding's range is in a later statement continuing it, as `a` is in `x = { }; x.a = 1;`
+            cls._join_attrpath_segments(child, body_factory, lines, (path_start or symbol) if after else None)
+            for child, after in zip(children, starts_after, strict=True)
+        ]
+        child_ends = [child_end for child_end, _ in child_results]
+        if is_segment:
+            pieced = len(children) > 1 or child_ends[0] > (children[0]["range"]["end"]["line"], children[0]["range"]["end"]["character"])
+            if not pieced:
+                joined = {"start": symbol_range["start"], "end": {**children[0]["range"]["end"]}}
+                symbol["range"] = joined
+                symbol["location"] = {**symbol["location"], "range": {**joined}}
+                symbol.pop("body", None)  # the factory would return the name's body
+                symbol["body"] = body_factory.create_symbol_body(symbol)
+                end = child_ends[0]
+                shifted = shifted or child_results[0][1]
+        else:
+            pieced = any(child_end > end for child_end in child_ends)
+
+        name = symbol["name"]
+        # positions, not slices: a generated line can hold thousands of symbols
+        start_line, end_line = lines[symbol["range"]["start"]["line"]], lines[symbol["range"]["end"]["line"]]
+        begins_line = _utf16_column_to_index(start_line, symbol["range"]["start"]["character"]) <= _NIX_INDENT.match(start_line).end()
+        end_index = _utf16_column_to_index(end_line, symbol["range"]["end"]["character"])
+        refusals: dict[str, str] = {}
+        if pieced:
+            refusals["replace_body"] = refusals["delete"] = (
+                f"`{name}` is defined by more than one statement (as `x` is in `x.a = 1; x.b = 2;`), so it has no single "
+                "body to replace or delete. Edit the attributes below it one by one, or the text with replace_content."
+            )
+        if shifted:
+            refusals["replace_body"] = refusals["delete"] = (
+                f"`{name}` follows a character outside the Basic Multilingual Plane (such as an emoji) on its line, where "
+                "Serena's columns differ from the language server's, so it would edit other text. Use replace_content."
+            )
+        if path_start is not None:
+            refusals.setdefault(
+                "delete",
+                f"`{name}` continues the attribute path of its statement, so deleting it alone would leave the path's start "
+                "behind (`a.` of `a.b = 1;`). Delete the statement through its first segment, or the text with replace_content.",
+            )
+            refusals["insert_before"] = (
+                f"`{name}` continues an attribute path, so code inserted before its line could land inside the path. Insert "
+                "before the path's first segment or after the binding above, or with replace_content."
+            )
+        whole = end_index > 0 and end_line[end_index - 1] == ";"
+        # what starts a binding: not a lambda, an inherited name (its name alone, no segment) or a path's continuation
+        begins_binding = symbol.get("kind") == ls_types.SymbolKind.Field and path_start is None and (is_segment or not name_only)
+        part = f"`{name}` is not a whole binding (as `x: x` is not, of `f = x: x;`, nor a name of an `inherit`)"
+        if not whole:  # only a binding's range takes its `;`
+            refusals.setdefault(
+                "delete", f"{part}, so deleting it would leave its binding broken. Edit the binding, or the text with replace_content."
+            )
+        if not begins_binding:
+            refusals.setdefault(
+                "insert_before",
+                f"{part}, so code inserted before its line could land inside its binding. Insert relative to a binding that "
+                "begins and ends its lines, or with replace_content.",
+            )
+        if not whole:
+            refusals.setdefault(
+                "insert_after",
+                f"`{name}` does not end with the `;` of a whole binding, so code inserted after its line could land inside a "
+                "statement. Insert relative to a binding that begins and ends its lines, or with replace_content.",
+            )
+        if not begins_line:
+            refusals.setdefault(
+                "insert_before",
+                f"`{name}` does not begin its line, so code inserted before the line would go before what precedes it there "
+                "(a `{` or another binding). Insert relative to a binding on its own line, or with replace_content.",
+            )
+        if not _NIX_LINE_END.fullmatch(end_line, end_index):
+            refusals.setdefault(
+                "insert_after",
+                f"`{name}` does not end its line, so code inserted after the line would go after what follows it there "
+                "(a `}` or the start of another binding). Insert relative to a binding on its own line, or with replace_content.",
+            )
+        if refusals:
+            symbol["edit_refusals"] = refusals
+        return max([end, *child_ends]), shifted
+
     @override
     def _document_symbols_cache_fingerprint(self) -> Hashable | None:
-        build_document_symbols_version = 6
+        build_document_symbols_version = 7
         return build_document_symbols_version
 
     @override
@@ -311,6 +447,7 @@ class NixLanguageServer(SolidLanguageServer):
         def extend_symbol_and_children(symbol: ls_types.UnifiedSymbolInformation) -> ls_types.UnifiedSymbolInformation:
             # Extend this symbol's range
             extended = self._extend_nix_symbol_range_to_include_semicolon(symbol, lines)
+            extended["_nix_shifted"] = self._is_nix_range_shifted(symbol, extended["range"], lines)
             # every body from one factory, so that the document keeps a single copy of its lines
             extended.pop("body", None)
             extended["body"] = body_factory.create_symbol_body(extended)
@@ -326,10 +463,11 @@ class NixLanguageServer(SolidLanguageServer):
         # Apply range extension to all symbols
         try:
             extended_root_symbols = [extend_symbol_and_children(sym) for sym in self._nix_definitions(document_symbols.root_symbols)]
+            for root in extended_root_symbols:  # a definition lifted out of a dropped symbol would still name it
+                root["parent"] = None
+                self._join_attrpath_segments(root, body_factory, lines)
         finally:
             _utf16_offsets.cache_clear()  # its tables are several times their lines' size
-        for root in extended_root_symbols:  # a definition lifted out of a dropped symbol would still name it
-            root["parent"] = None
 
         return DocumentSymbols(extended_root_symbols)
 

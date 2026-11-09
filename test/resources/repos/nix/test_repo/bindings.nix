@@ -23,5 +23,8 @@
     };
   nextLine = 1
     ;
-  inherit (builtins) toString;
+  wrapped =
+    w: w;
+  inherit (builtins)
+    toString;
 }

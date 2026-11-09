@@ -272,7 +272,9 @@ class TestNixLanguageServer:
         assert language_server.is_running()
 
     @pytest.mark.parametrize("language_server", [LanguageServerId.NIX], indirect=True)
-    @pytest.mark.parametrize("rel_path", ["default.nix", "flake.nix", "lib/utils.nix", "modules/example.nix", "bindings.nix", "astral.nix"])
+    @pytest.mark.parametrize(
+        "rel_path", ["default.nix", "flake.nix", "lib/utils.nix", "modules/example.nix", "bindings.nix", "astral.nix", "dotted.nix"]
+    )
     def test_symbol_body_matches_its_range(self, language_server: SolidLanguageServer, rel_path: str) -> None:
         """
         find_symbol shows a symbol's body and replace_symbol_body overwrites the symbol's range, so the two
@@ -316,6 +318,10 @@ class TestNixLanguageServer:
             '"quoted-name" = 2;',
             "split\n    = 3;",
             "commented /* before the equals sign */ = 4;",
+            # the segments before the last cover the statement from their own name
+            'services.web.hosts."web-host" = { root = "/srv"; };',
+            'web.hosts."web-host" = { root = "/srv"; };',
+            'hosts."web-host" = { root = "/srv"; };',
             '"web-host" = { root = "/srv"; };',
             'root = "/srv";',
             "lambda = x: x;",
@@ -330,6 +336,7 @@ class TestNixLanguageServer:
             "tight=8;",
             "splitValue\n    = {\n      e = 5;\n    };",
             "e = 5;",
+            "wrapped =\n    w: w;",
         }
         bodies = {s["body"].get_text() for s in all_symbols}
         # lambdas inside bindings, including ones whose text contains `=`, and inherited names; an anonymous lambda
@@ -375,3 +382,21 @@ class TestNixLanguageServer:
     @pytest.mark.parametrize("language_server", [LanguageServerId.NIX], indirect=True)
     def test_no_name_path_goes_through_an_anonymous_lambda(self, language_server: SolidLanguageServer) -> None:
         assert [s["name"] for s in request_all_symbols(language_server) if s["name"] == "(anonymous lambda)"] == []
+
+    @pytest.mark.parametrize("language_server", [LanguageServerId.NIX], indirect=True)
+    def test_dotted_key_segments_cover_their_statement(self, language_server: SolidLanguageServer) -> None:
+        """
+        The segments of an attribute path before its last had only their name from nixd, so `single`'s body was
+        `single`, and a new `single.path.only = 2;` replaced the name alone, leaving `.path.only = 1;` after it.
+        """
+        all_symbols, _ = language_server.request_document_symbols("dotted.nix").get_all_symbols_and_roots()
+        bodies = {LanguageServerSymbol(s).get_name_path(): s["body"].get_text() for s in all_symbols}
+        assert bodies["single"] == "single.path.only = 1;"
+        assert bodies["single/path"] == "path.only = 1;"
+        assert bodies["single/path/only"] == "only = 1;"
+        assert bodies["spread"] == "spread.over\n    .lines = 2;"
+        assert bodies["fromSet"] == "fromSet", "an inherited name is no segment, though nixd lists its set's attributes below it"
+        refused = {LanguageServerSymbol(s).get_name_path() for s in all_symbols if "replace_body" in s.get("edit_refusals", {})}
+        # merged by nixd: two statements under `services.web`, `between` inside `piece`, `whole.extra` after `whole`,
+        # `outer.inner.b` after `outer`, below a segment inside it, and `late.added` after `late = { };`
+        assert refused == {"services", "services/web", "piece", "whole", "outer", "outer/inner", "late"}

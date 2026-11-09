@@ -243,6 +243,13 @@ class UnifiedSymbolInformation(TypedDict):
     structure of a Nix file. Omitted, the kind decides. Added for Serena, not part of the LSP.
     """
 
+    edit_refusals: NotRequired[dict[str, str]]
+    """
+    Why an edit of the symbol would break the file, for each such edit (`replace_body`, `delete`, `insert_before`,
+    `insert_after`): a Nix attribute defined by more than one statement (`x.a = 1; x.b = 2;`) has no single body, and
+    deleting `b` from `a.b = 1;` alone leaves `a.`. Added for Serena, not part of the LSP.
+    """
+
 
 class MarkupKind(Enum):
     """Describes the content type that a client supports in various

@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator, Reversible
 from contextlib import contextmanager
 from types import TracebackType
-from typing import Any, Generic, Self, TypeVar, cast
+from typing import Any, Generic, Literal, Self, TypeVar, cast
 
 from serena.jetbrains.jetbrains_plugin_client import JetBrainsPluginClient, ServerNotFoundError
 from serena.symbol import JetBrainsSymbol, LanguageServerSymbol, LanguageServerSymbolRetriever, PositionInFile, Symbol
@@ -107,6 +107,12 @@ class CodeEditor(Generic[TSymbol], ABC):
         :return: the unique symbol
         """
 
+    @staticmethod
+    def _refuse_breaking_edit(symbol: TSymbol, edit: Literal["replace_body", "delete", "insert_before", "insert_after"]) -> None:
+        refusal = symbol.get_edit_refusal(edit)
+        if refusal is not None:
+            raise ValueError(refusal)
+
     def replace_body(self, name_path: str, relative_file_path: str, body: str) -> None:
         """
         Replaces the body of the symbol with the given name_path in the given file.
@@ -116,6 +122,7 @@ class CodeEditor(Generic[TSymbol], ABC):
         :param body: the new body
         """
         symbol = self._find_unique_symbol(name_path, relative_file_path)
+        self._refuse_breaking_edit(symbol, "replace_body")
         start_pos = symbol.get_body_start_position_or_raise()
         end_pos = symbol.get_body_end_position_or_raise()
 
@@ -148,6 +155,7 @@ class CodeEditor(Generic[TSymbol], ABC):
         Inserts content after the symbol with the given name in the given file.
         """
         symbol = self._find_unique_symbol(name_path, relative_file_path)
+        self._refuse_breaking_edit(symbol, "insert_after")
         # Note: for body to be available, the symbol dto that the symbol instance is built from
         # must have been retrieved either with body or at least with location.
         # since _find_unique_symbol passes include_location=True, it works here
@@ -189,6 +197,7 @@ class CodeEditor(Generic[TSymbol], ABC):
         Inserts content before the symbol with the given name in the given file.
         """
         symbol = self._find_unique_symbol(name_path, relative_file_path)
+        self._refuse_breaking_edit(symbol, "insert_before")
         symbol_start_pos = symbol.get_body_start_position_or_raise()
 
         # insert position is the start of line where the symbol is defined
@@ -268,6 +277,7 @@ class CodeEditor(Generic[TSymbol], ABC):
         Deletes the symbol with the given name in the given file.
         """
         symbol = self._find_unique_symbol(name_path, relative_file_path)
+        self._refuse_breaking_edit(symbol, "delete")
         start_pos = symbol.get_body_start_position_or_raise()
         end_pos = symbol.get_body_end_position_or_raise()
 
