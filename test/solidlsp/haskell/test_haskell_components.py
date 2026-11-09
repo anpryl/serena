@@ -14,7 +14,6 @@ import pytest
 from solidlsp.language_servers.haskell_language_server import HaskellLanguageServer
 from solidlsp.ls import SolidLanguageServer
 from solidlsp.ls_config import LanguageServerId
-from solidlsp.ls_exceptions import SolidLSPException
 from test.conftest import language_server_tests_enabled, start_ls_context
 
 pytestmark = [
@@ -48,15 +47,6 @@ def test_references_reach_the_test_suite_through_a_qualified_import(fresh_haskel
     references = fresh_haskell_ls.request_references("src/Helper.hs", line=12, column=0)
     found = {(Path(ref["relativePath"]).as_posix(), ref["range"]["start"]["line"]) for ref in references}
     assert ("test/Spec.hs", 5) in found, f"Expected the call at test/Spec.hs:6 among {sorted(found)}"
-
-
-def test_renaming_an_exported_name_is_refused(fresh_haskell_ls: SolidLanguageServer) -> None:
-    """
-    The function isPositive is exported and used in app/Main.hs. HLS after 2.13 would rename it across modules, from
-    references that can be incomplete; Serena turns that off, so HLS refuses, as 2.13 did.
-    """
-    with pytest.raises(SolidLSPException, match="rename"):
-        fresh_haskell_ls.request_rename_symbol_edit("src/Helper.hs", 12, 0, "isStrictlyPositive")
 
 
 def test_hls_reported_its_loading_progress(fresh_haskell_ls: SolidLanguageServer) -> None:

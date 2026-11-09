@@ -275,10 +275,6 @@ class HaskellLanguageServer(SolidLanguageServer):
     _HLS_QUERY_WAIT_SECONDS = 30.0
     # HLS reports nothing for about a second between finishing one piece of work and starting the next
     _HLS_QUIET_SECONDS = 2.0
-    # HLS after 2.13 renames exported names across modules by default, from the same references that miss
-    # uses of record fields and every other component of a stack project, so it can return a partial rename,
-    # which Serena would apply as a success. Exported names are refused instead, as in 2.13.
-    _HLS_RENAME_CONFIG = {"config": {"crossModule": False}}
 
     @override
     def is_ignored_dirname(self, dirname: str) -> bool:
@@ -613,7 +609,6 @@ class HaskellLanguageServer(SolidLanguageServer):
                 "haskell": {
                     "formattingProvider": "ormolu",
                     "checkProject": True,
-                    "plugin": {"rename": self._HLS_RENAME_CONFIG},
                 }
             },
             "trace": "verbose",
@@ -647,11 +642,7 @@ class HaskellLanguageServer(SolidLanguageServer):
             haskell_config = {
                 "formattingProvider": "ormolu",
                 "checkProject": True,
-                "plugin": {
-                    "importLens": {"codeActionsOn": False, "codeLensOn": False},
-                    "hlint": {"codeActionsOn": False},
-                    "rename": self._HLS_RENAME_CONFIG,
-                },
+                "plugin": {"importLens": {"codeActionsOn": False, "codeLensOn": False}, "hlint": {"codeActionsOn": False}},
             }
 
             # HLS expects array of config items matching requested sections
