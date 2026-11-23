@@ -10,7 +10,7 @@ import shutil
 import stat
 import threading
 from collections.abc import Iterator, Sequence
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
@@ -605,6 +605,24 @@ class ProjectConfig(SharedConfig, ModeSelectionDefinitionWithAddedModes):
 
         return d
 
+    def has_same_settings(self, other: "ProjectConfig") -> bool:
+        """
+        :param other: another project configuration
+        :return: whether the other configuration holds the same values in all of its configuration file fields
+        """
+        return self._to_yaml_dict() == other._to_yaml_dict()
+
+    def copy(self) -> Self:
+        """
+        :return: a copy of this configuration, once it is complete (see :meth:`await_asynchronous_completion`), whose
+            collection-valued fields are new collections holding the same elements as this configuration's
+        """
+        self.await_asynchronous_completion()
+        collection_values = {
+            f.name: copy(value) for f in dataclasses.fields(self) if isinstance(value := getattr(self, f.name), list | dict | set)
+        }
+        return dataclasses.replace(self, **collection_values)
+
     @classmethod
     def _project_local_yml_path(cls, project_yml_path: str) -> str:
         return os.path.join(os.path.dirname(project_yml_path), cls.SERENA_LOCAL_PROJECT_FILE)
@@ -615,6 +633,7 @@ class ProjectConfig(SharedConfig, ModeSelectionDefinitionWithAddedModes):
         project_root: Path | str,
         serena_config: "SerenaConfig",
         autogen: ProjectConfigAutoGenerationMode = ProjectConfigAutoGenerationMode.NONE,
+        save_if_incomplete: bool = True,
     ) -> Self:
         """
         Load a ProjectConfig instance from the path to the project root.
@@ -622,6 +641,8 @@ class ProjectConfig(SharedConfig, ModeSelectionDefinitionWithAddedModes):
         :param project_root: the path to the project root
         :param serena_config: the global Serena configuration
         :param autogen: the auto-generation mode to apply if the project configuration does not yet exist
+        :param save_if_incomplete: whether to re-save an incomplete configuration file with the default values of the
+            missing fields; the returned configuration has these values either way
         """
         project_root = Path(project_root)
         project_folder_name = project_root.name
@@ -658,7 +679,7 @@ class ProjectConfig(SharedConfig, ModeSelectionDefinitionWithAddedModes):
         project_config = cls._from_dict(yaml_data, local_override_keys=local_override_keys)
 
         # if the configuration was incomplete, re-save it to disk
-        if not was_complete:
+        if not was_complete and save_if_incomplete:
             log.info("Project configuration in %s was incomplete, re-saving with default values for missing fields", yaml_path)
             project_config.save(str(yaml_path), save_project_local_yml=False)
 
@@ -867,6 +888,12 @@ class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
     ls_priorities: dict[str, int] | None = None
     """
     mapping from language server keys to their priority (higher number = higher priority).
+    """
+
+    route_worktree_paths: bool = False
+    """
+    whether a tool call whose `relative_path` is an absolute path inside another git worktree of the active project's
+    repository runs against a project for that worktree. Applies to the tools interface with the LSP backend only.
     """
 
     # settings with overridden defaults

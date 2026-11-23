@@ -23,6 +23,7 @@ from serena.repl.facade import SUCCESS_RESULT
 from serena.util.class_decorators import singleton
 from serena.util.inspection import iter_subclasses
 from serena.util.text_utils import TextOutputUtils
+from serena.worktree_routing import WorktreeRoute, WorktreeRoutingRefusal
 from solidlsp.ls_exceptions import SolidLSPException
 
 if TYPE_CHECKING:
@@ -42,7 +43,7 @@ class Component(ABC):
 
     def get_project_root(self) -> str:
         """
-        :return: the root directory of the active project, raises a ValueError if no active project configuration is set
+        :return: the root directory of :attr:`project`; raises a ValueError if there is no such project
         """
         return self.project.project_root
 
@@ -245,7 +246,7 @@ class Tool(Component):
 
     def _log_tool_application(self, frame: Any) -> None:
         params = {}
-        ignored_params = {"self", "log_call", "catch_exceptions", "args", "apply_fn"}
+        ignored_params = {"self", "log_call", "catch_exceptions", "args", "apply_fn", "routes"}
         for param, value in frame.f_locals.items():
             if param in ignored_params:
                 continue
@@ -320,6 +321,9 @@ class Tool(Component):
             except Exception as e:
                 log.info(f"Failed to get client info: {e}.")
 
+        # the call's routing, once the task has determined it (for errors raised outside the task's thread)
+        routes: list[WorktreeRoute] = []
+
         def task() -> str:
             apply_fn = self.get_apply_fn()
 
@@ -332,58 +336,26 @@ class Tool(Component):
                 if log_call:
                     self._log_tool_application(inspect.currentframe())
 
-                # check whether the tool requires an active project and language server
-                if not isinstance(self, ToolMarkerDoesNotRequireActiveProject):
-                    if self.agent.get_active_project() is None:
-                        raise ToolCallError(
-                            "No active project. Ask the user to provide the project path or to select a project from this list of known projects: "
-                            + f"{self.agent.serena_config.project_names}"
-                        )
-
-                # construct apply kwargs, adding session_id if the tool is session-aware
-                apply_kwargs = dict(kwargs)
-
-                # apply the actual tool
-                try:
-                    result = apply_fn(**apply_kwargs)
-                except SolidLSPException as e:
-                    if e.is_language_server_terminated():
-                        affected_language = e.get_affected_language()
-                        if affected_language is not None:
-                            log.error(
-                                f"Language server terminated while executing tool ({e}). Restarting the language server and retrying ..."
-                            )
-                            self.agent.get_language_server_manager_or_raise().restart_language_server(affected_language)
-                            result = apply_fn(**apply_kwargs)
-                        else:
-                            log.error(
-                                f"Language server terminated while executing tool ({e}), but affected language is unknown. Not retrying."
-                            )
-                            raise
-                    else:
-                        raise
-
-                # record tool usage
-                self.agent.record_tool_usage(apply_kwargs, result, self)
-
+                # determine whether the call is routed to another git worktree of the active project's repository
+                route = self.agent.get_worktree_router().route(self, kwargs)
+                if route is not None:
+                    routes.append(route)
             except ToolCallError:
                 raise
+            except WorktreeRoutingRefusal as e:
+                raise ToolCallError(str(e)) from e
             except Exception as e:
                 msg = f"{e.__class__.__name__}: {e}"
                 log.error(msg, exc_info=e)
                 raise ToolCallError(msg)
 
-            if log_call:
-                log.info(f"Result: {result}")
-
-            try:
-                ls_manager = self.agent.get_language_server_manager()
-                if ls_manager is not None:
-                    ls_manager.save_all_caches_if_due()
-            except Exception as e:
-                log.error(f"Error saving language server cache: {e}")
-
-            return result
+            if route is None:
+                return self._apply_in_active_project(apply_fn, kwargs, log_call)
+            with self.agent.thread_project_context(route.project):
+                try:
+                    return self._apply_in_active_project(apply_fn, route.kwargs, log_call)
+                except ToolCallError as e:
+                    raise ToolCallError(route.annotate_error(e.get_error_message())) from e
 
         # execute the tool in the agent's task executor, with timeout
         # (task timeout bounds task execution in the dispatcher once it runs, result timeout limits the time we wait)
@@ -397,6 +369,8 @@ class Tool(Component):
         except TimeoutError:
             msg = f"Tool execution timed out after {timeout} seconds. "
             log.error(msg)
+            if routes:
+                msg = routes[0].annotate_error(msg)
             tool_call_error = ToolCallError(msg)
         except Exception as e:  # unexpected errors (exceptions in the task itself are caught and forwarded as ToolCallError)
             msg = f"{e.__class__.__name__}: {e}"
@@ -406,6 +380,65 @@ class Tool(Component):
             return tool_call_error.get_error_message()
         else:
             raise tool_call_error
+
+    def _apply_in_active_project(self, apply_fn: ApplyMethodProtocol, kwargs: dict[str, Any], log_call: bool) -> str:
+        """
+        Applies the tool to the active project, as seen by the current thread, retrying once if a language server terminated.
+
+        :param apply_fn: the tool's apply function
+        :param kwargs: the arguments to apply the tool with
+        :param log_call: whether to log the tool's result
+        :return: the tool's result
+        """
+        try:
+            # check whether the tool requires an active project and language server
+            if not isinstance(self, ToolMarkerDoesNotRequireActiveProject):
+                if self.agent.get_active_project() is None:
+                    raise ToolCallError(
+                        "No active project. Ask the user to provide the project path or to select a project from this list of known projects: "
+                        + f"{self.agent.serena_config.project_names}"
+                    )
+
+            # construct apply kwargs, adding session_id if the tool is session-aware
+            apply_kwargs = dict(kwargs)
+
+            # apply the actual tool
+            try:
+                result = apply_fn(**apply_kwargs)
+            except SolidLSPException as e:
+                if e.is_language_server_terminated():
+                    affected_language = e.get_affected_language()
+                    if affected_language is not None:
+                        log.error(f"Language server terminated while executing tool ({e}). Restarting the language server and retrying ...")
+                        self.agent.get_language_server_manager_or_raise().restart_language_server(affected_language)
+                        result = apply_fn(**apply_kwargs)
+                    else:
+                        log.error(f"Language server terminated while executing tool ({e}), but affected language is unknown. Not retrying.")
+                        raise
+                else:
+                    raise
+
+            # record tool usage
+            self.agent.record_tool_usage(apply_kwargs, result, self)
+
+        except ToolCallError:
+            raise
+        except Exception as e:
+            msg = f"{e.__class__.__name__}: {e}"
+            log.error(msg, exc_info=e)
+            raise ToolCallError(msg)
+
+        if log_call:
+            log.info(f"Result: {result}")
+
+        try:
+            ls_manager = self.agent.get_language_server_manager()
+            if ls_manager is not None:
+                ls_manager.save_all_caches_if_due()
+        except Exception as e:
+            log.error(f"Error saving language server cache: {e}")
+
+        return result
 
     @staticmethod
     def _to_json(x: Any) -> str:

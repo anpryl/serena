@@ -290,7 +290,8 @@ class GetDiagnosticsForFileTool(Tool, ToolMarkerSymbolicRead, LspApiMixin):
         max_answer_chars: int = -1,
     ) -> str:
         """
-        Gets diagnostics for a file. Diagnostics are grouped as `relative_path -> severity -> name_path -> diagnostics_results`.
+        Gets diagnostics for a file. Diagnostics are grouped as `file_path -> severity -> name_path -> diagnostics_results`,
+        where file_path is the file's path relative to the project root, or absolute for a file of another git worktree.
         If a diagnostic cannot be mapped to a symbol, it is grouped under the special name path `<file>`.
 
         :param relative_path: the relative path to the file to inspect.
@@ -326,7 +327,8 @@ class GetDiagnosticsForSymbolTool(Tool, ToolMarkerSymbolicRead, ToolMarkerOption
         """
         Gets diagnostics for the specified symbol. When `check_symbol_references` is true, diagnostics for all
         referencing symbols are also included. The result is grouped as
-        `relative_path -> severity -> name_path -> diagnostics_results`.
+        `file_path -> severity -> name_path -> diagnostics_results`, where file_path is the file's path relative to the
+        project root.
 
         :param name_path: the name path of the symbol to inspect.
         :param reference_file: optional file path used to disambiguate the symbol search.

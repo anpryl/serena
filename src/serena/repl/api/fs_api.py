@@ -8,6 +8,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from serena.project import OutputPaths
 from serena.tools import CreateTextFileTool, FindFileTool, ListDirTool, ReadFileTool, SearchForPatternTool
 from serena.util.text_utils import MatchedConsecutiveLines
 from solidlsp.ls_utils import TextUtils
@@ -46,13 +47,13 @@ class FileContentRenderer(Renderer[FileContent]):
 
 class DirectoryListing(RepresentableViaRenderer):
     """
-    The entries of a directory: `dirs` and `files` (relative paths).
+    The entries of a directory: `dirs` and `files` (as named by the project's output paths, see `Project.output_paths`).
     """
 
     def __init__(self, dirs: list[str], files: list[str], renderer: "DirectoryListingRenderer"):
         """
-        :param dirs: the relative paths of the directories
-        :param files: the relative paths of the files
+        :param dirs: the paths of the directories
+        :param files: the paths of the files
         :param renderer: the renderer to use for representing the listing
         """
         super().__init__(renderer)
@@ -86,11 +87,16 @@ class PatternMatches(RepresentableViaRenderer):
     def __len__(self) -> int:
         return len(self.matches)
 
-    def matches_by_file_(self) -> dict[str, list[MatchedConsecutiveLines]]:
+    def matches_by_file_(self, output_paths: OutputPaths | None = None) -> dict[str, list[MatchedConsecutiveLines]]:
+        """
+        :param output_paths: the paths by which to name the files; if None, they are named by their relative paths
+        :return: the matches, by file
+        """
         result: defaultdict[str, list[MatchedConsecutiveLines]] = defaultdict(list)
         for match in self.matches:
             assert match.source_file_path is not None
-            result[match.source_file_path].append(match)
+            path = output_paths.of(match.source_file_path) if output_paths is not None else match.source_file_path
+            result[path].append(match)
         return result
 
 
@@ -103,8 +109,15 @@ class PatternMatchesRenderer(Renderer[PatternMatches]):
 
     _TEXT_TRUNCATE = 60
 
+    def __init__(self, agent: "SerenaAgent", max_answer_chars: int, output_paths: OutputPaths):
+        """
+        :param output_paths: the paths by which to name the files containing matches
+        """
+        super().__init__(agent, max_answer_chars)
+        self._output_paths = output_paths
+
     def render(self, obj: PatternMatches) -> str:
-        matches_by_file = obj.matches_by_file_()
+        matches_by_file = obj.matches_by_file_(self._output_paths)
         file_to_matches = {path: [m.to_display_string() for m in matches] for path, matches in matches_by_file.items()}
 
         # capture lightweight match data for shortening before serialization
@@ -219,7 +232,7 @@ class FsApi(FacadeApi):
         # write the file
         abs_path.parent.mkdir(parents=True, exist_ok=True)
         abs_path.write_text(content, encoding=project.project_config.encoding, newline=project.line_ending.newline_str)
-        answer = f"File created: {relative_path}."
+        answer = f"File created: {project.output_paths.of(relative_path)}."
         if will_overwrite_existing:
             answer += " Overwrote existing file."
         return answer
@@ -238,11 +251,18 @@ class FsApi(FacadeApi):
         """
         project = self._get_project()
         if not project.relative_path_exists(relative_path):
-            raise FileNotFoundError(f"Directory not found: {relative_path} (check if the path is correct relative to the project root)")
+            raise FileNotFoundError(
+                f"Directory not found: {project.output_paths.of(relative_path)} (check that the path names a directory of the project)"
+            )
         project.validate_relative_path(relative_path)
 
         scan_result = project.scan_directory(relative_path, recursive=recursive, skip_ignored_paths=skip_ignored_files)
-        return DirectoryListing(scan_result.directories, scan_result.files, DirectoryListingRenderer(self._agent, max_answer_chars))
+        output_paths = project.output_paths
+        return DirectoryListing(
+            [output_paths.of(d) for d in scan_result.directories],
+            [output_paths.of(f) for f in scan_result.files],
+            DirectoryListingRenderer(self._agent, max_answer_chars),
+        )
 
     @facade_method(corresponding_tool=FindFileTool)
     def find_file(self, file_mask: str, relative_path: str, skip_ignored_files: bool = False) -> list[str]:
@@ -252,7 +272,7 @@ class FsApi(FacadeApi):
         :param file_mask: the filename or file mask (using the wildcards * or ?) to search for
         :param relative_path: the relative path to the directory to search in; pass "." to scan the project root
         :param skip_ignored_files: whether to skip ignored files/directories
-        :return: the relative paths of the matching files
+        :return: the paths of the matching files (as named by the project's output paths, see `Project.output_paths`)
         """
         project = self._get_project()
         project.validate_relative_path(relative_path)
@@ -263,7 +283,7 @@ class FsApi(FacadeApi):
             skip_ignored_paths=skip_ignored_files,
             is_matching_file=lambda e: fnmatch(e.name, file_mask),
         )
-        return scan_result.files
+        return [project.output_paths.of(f) for f in scan_result.files]
 
     @facade_method(corresponding_tool=SearchForPatternTool)
     def search_for_pattern(
@@ -311,4 +331,4 @@ class FsApi(FacadeApi):
             code_files_only=restrict_search_to_code_files,
             skip_ignored_files=skip_ignored_files,
         )
-        return PatternMatches(matches, PatternMatchesRenderer(self._agent, max_answer_chars))
+        return PatternMatches(matches, PatternMatchesRenderer(self._agent, max_answer_chars, project.output_paths))

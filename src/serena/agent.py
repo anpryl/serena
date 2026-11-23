@@ -37,6 +37,7 @@ from serena.config.serena_config import (
     ModeSelectionDefinitionWithBaseModes,
     NamedApiInclusionDefinition,
     NamedToolInclusionDefinition,
+    ProjectConfig,
     RegisteredProject,
     SerenaConfig,
     SerenaPaths,
@@ -77,6 +78,7 @@ from serena.tools import (
 from serena.util.gui import system_has_usable_display
 from serena.util.inspection import iter_subclasses
 from serena.util.logging import MemoryLogHandler
+from serena.worktree_routing import WorktreeRouter
 from solidlsp.ls_config import LanguageServerIdLike
 from solidlsp.util import subprocess_util
 from solidlsp.util.subprocess_util import subprocess_run
@@ -588,6 +590,13 @@ class DashboardManager:
 
 
 class SerenaAgent:
+    class _ThreadProjectOverride(threading.local):
+        """
+        The project overriding the active project in the current thread (see :meth:`SerenaAgent.thread_project_context`).
+        """
+
+        project: Project | None = None
+
     def __init__(
         self,
         project: str | None = None,
@@ -613,6 +622,8 @@ class SerenaAgent:
             if necessary.
         """
         self._active_project: Project | None = None  # NOTE: field name used in __del__
+        self._thread_project_override = self._ThreadProjectOverride()
+        self._worktree_router = WorktreeRouter(self)
         self._project_activation_callback = project_activation_callback
         self._project_activation_error: str | None = project_activation_error
         self._gui_log_viewer: Optional["GuiLogViewer"] = None
@@ -935,8 +946,9 @@ class SerenaAgent:
         return self._task_executor.get_last_executed_task()
 
     def get_language_server_manager(self) -> LanguageServerManager | None:
-        if self._active_project is not None:
-            return self._active_project.language_server_manager
+        active_project = self.get_active_project()
+        if active_project is not None:
+            return active_project.language_server_manager
         return None
 
     def get_language_server_manager_or_raise(self) -> LanguageServerManager:
@@ -1016,13 +1028,38 @@ class SerenaAgent:
 
     def get_active_project(self) -> Project | None:
         """
-        :return: the active project or None if no project is active
+        :return: the project overriding the active project in the current thread (see :meth:`thread_project_context`), if any;
+            otherwise the active project or None if no project is active
         """
+        override = self._thread_project_override.project
+        if override is not None:
+            return override
         return self._active_project
+
+    @contextmanager
+    def thread_project_context(self, project: Project) -> Iterator[None]:
+        """
+        Context manager for overriding the active project in the current thread only.
+        Other threads keep seeing the active project, and so does the current thread once the context is left.
+
+        :param project: the project to be active in the current thread
+        """
+        previous_override = self._thread_project_override.project
+        self._thread_project_override.project = project
+        try:
+            yield
+        finally:
+            self._thread_project_override.project = previous_override
+
+    def get_worktree_router(self) -> WorktreeRouter:
+        """
+        :return: the router of tool calls addressing other git worktrees of the active project's repository
+        """
+        return self._worktree_router
 
     def get_active_project_or_raise(self) -> Project:
         """
-        :return: the active project or raises an exception if no project is active
+        :return: the project returned by :meth:`get_active_project`; raises an exception if it is None
         """
         project = self.get_active_project()
         if project is None:
@@ -1307,20 +1344,29 @@ class SerenaAgent:
 
         return msg
 
+    def _create_active_modes(self, project_config: ProjectConfig | None) -> ActiveModes:
+        """
+        :param project_config: the configuration of the project to be active, if any
+        :return: the modes resulting from the Serena configuration, the given project configuration and the session's mode
+            overrides (if any)
+        """
+        background_base_modes = []
+        if self._language_backend.is_jetbrains():
+            background_base_modes.append(SerenaAgentMode.from_name_internal("jetbrains"))
+        active_modes = ActiveModes(background_base_modes=background_base_modes)
+        active_modes.apply(self.serena_config)
+        if project_config is not None:
+            active_modes.apply(project_config)
+        if self._session_mode_selection_definition:
+            active_modes.apply(self._session_mode_selection_definition)
+        return active_modes
+
     def _update_active_modes(self, log_message: bool = True) -> None:
         """
         Updates the active modes based on the Serena configuration, the active project configuration (if any),
         and mode overrides (if any).
         """
-        background_base_modes = []
-        if self._language_backend.is_jetbrains():
-            background_base_modes.append(SerenaAgentMode.from_name_internal("jetbrains"))
-        self._active_modes = ActiveModes(background_base_modes=background_base_modes)
-        self._active_modes.apply(self.serena_config)
-        if self._active_project:
-            self._active_modes.apply(self._active_project.project_config)
-        if self._session_mode_selection_definition:
-            self._active_modes.apply(self._session_mode_selection_definition)
+        self._active_modes = self._create_active_modes(self._active_project.project_config if self._active_project else None)
         if log_message:
             active_mode_names = self._active_modes.get_mode_names()
             log.info(f"Active modes ({len(active_mode_names)}): {', '.join(active_mode_names)}")
@@ -1341,9 +1387,7 @@ class SerenaAgent:
 
             # apply active project configuration (if any)
             if self._active_project is not None:
-                tool_set = tool_set.apply(self._active_project.project_config)
-                if self._active_project.project_config.read_only:
-                    tool_set = tool_set.without_editing_tools()
+                tool_set = self._apply_project_config_to_tool_set(tool_set, self._active_project.project_config)
 
         self._active_tools = tool_set.to_available_tools(self._all_tools)
         log.info(f"Active tools ({len(self._active_tools)}): {', '.join(self._active_tools.tool_names)}")
@@ -1360,6 +1404,28 @@ class SerenaAgent:
                 f"{active_tools_not_exposed}\n"
                 "Consider adjusting your configuration to include these tools if you want to use them."
             )
+
+    @staticmethod
+    def _apply_project_config_to_tool_set(tool_set: ToolSet, project_config: ProjectConfig) -> ToolSet:
+        """
+        :param tool_set: the tool set to restrict
+        :param project_config: the project configuration, whose tool inclusions and exclusions and read-only setting apply
+        :return: the tool set as restricted by the project configuration
+        """
+        tool_set = tool_set.apply(project_config)
+        if project_config.read_only:
+            tool_set = tool_set.without_editing_tools()
+        return tool_set
+
+    def get_active_tool_names_for_project_config(self, project_config: ProjectConfig) -> set[str]:
+        """
+        :param project_config: a project configuration
+        :return: the names of the tools that would be active, with the tools interface, upon activation of a project with
+            the given configuration (whose modes apply)
+        """
+        tool_set = self._base_toolset.apply(*self._create_active_modes(project_config).get_modes())
+        tool_set = self._apply_project_config_to_tool_set(tool_set, project_config)
+        return set(tool_set.to_available_tools(self._all_tools).tool_names)
 
     def create_default_facade_list(self, api_scope: ApiScope) -> list[Facade]:
         """
@@ -1710,6 +1776,7 @@ class SerenaAgent:
         if self._dashboard_manager:
             self._dashboard_manager.shutdown()
             self._dashboard_manager = None
+        self._worktree_router.shutdown(timeout=timeout)
         if self._active_project is not None:
             log.info(f"Shutting down active project '{self._active_project.project_name}' ...")
             self._active_project.shutdown(timeout=timeout)
@@ -1738,7 +1805,8 @@ class SerenaAgent:
     @contextmanager
     def active_project_context(self, project: Project) -> Iterator[None]:
         """
-        Context manager for temporarily setting/overriding the active project
+        Context manager for temporarily setting the process-wide active project (the one every thread sees unless
+        :meth:`thread_project_context` overrides it in that thread)
 
         :param project: the project to be active
         """

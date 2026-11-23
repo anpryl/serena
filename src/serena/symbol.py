@@ -22,7 +22,7 @@ from solidlsp.ls_types import Position, SymbolKind, UnifiedSymbolInformation
 from solidlsp.ls_utils import TextUtils
 
 from .ls_manager import LanguageServerManager
-from .project import Project
+from .project import OutputPaths, Project
 
 log = logging.getLogger(__name__)
 NAME_PATH_SEP = "/"
@@ -53,10 +53,18 @@ class LanguageServerSymbolLocation:
         if self.relative_path is not None:
             self.relative_path = self.relative_path.replace("/", os.path.sep)
 
-    def to_dict(self, include_relative_path: bool = True) -> dict[str, Any]:
+    def to_dict(self, include_relative_path: bool = True, output_paths: OutputPaths | None = None) -> dict[str, Any]:
+        """
+        :param include_relative_path: whether to include the path of the file (entry `relative_path`)
+        :param output_paths: the paths by which to name the file; if None, it is named by its relative path
+        :return: the dictionary representation of the location, whose `relative_path` entry holds the file's path as
+            named by `output_paths` (absolute if they are)
+        """
         result = asdict(self)
         if not include_relative_path:
             result.pop("relative_path", None)
+        elif output_paths is not None and self.relative_path is not None:
+            result["relative_path"] = output_paths.of(self.relative_path)
         return result
 
     def has_position_in_file(self) -> bool:
@@ -464,6 +472,7 @@ class LanguageServerSymbol(Symbol, ToStringMixin):
         children_name: bool | None = None,
         relative_path: bool = False,
         child_inclusion_predicate: Callable[[Self], bool] | None = None,
+        output_paths: OutputPaths | None = None,
     ) -> OutputDict:
         """
         Converts the symbol to a dictionary.
@@ -480,12 +489,14 @@ class LanguageServerSymbol(Symbol, ToStringMixin):
             and pass the children without passing the parent body to the LM.
         :param children_name_path: whether to include the name path of the children; if None, defaults to the value of `name_path`
         :param children_name: whether to include the name of the children; if None, defaults to the value of `name`
-        :param relative_path: whether to include the relative path of the symbol.
+        :param relative_path: whether to include the path of the symbol's file (entry `relative_path`, as named by
+            `output_paths`).
             If `location` is True, this defines whether to include the path in the location entry.
-            If `location` is False, this defines whether to include the relative path as a top-level entry.
-            Relative paths of the symbol's children are always excluded.
+            If `location` is False, this defines whether to include the path as a top-level entry.
+            The paths of the symbol's children are always excluded.
         :param child_inclusion_predicate: an optional predicate that decides whether a child symbol
             should be included.
+        :param output_paths: the paths by which to name the symbol's file; if None, it is named by its relative path
         :return: a dictionary representation of the symbol
         """
         result: LanguageServerSymbol.OutputDict = {}
@@ -504,9 +515,12 @@ class LanguageServerSymbol(Symbol, ToStringMixin):
             result["kind"] = self.symbol_kind_name
 
         if location:
-            result["location"] = self.location.to_dict(include_relative_path=relative_path)
+            result["location"] = self.location.to_dict(include_relative_path=relative_path, output_paths=output_paths)
         elif relative_path:
-            result["relative_path"] = self.relative_path
+            symbol_relative_path = self.relative_path
+            if output_paths is not None and symbol_relative_path is not None:
+                symbol_relative_path = output_paths.of(symbol_relative_path)
+            result["relative_path"] = symbol_relative_path
 
         if body_location:
             body_start_line, body_end_line = self.get_body_line_numbers()
@@ -795,7 +809,14 @@ class LanguageServerSymbolRetriever:
             include_rel_path = within_relative_path is not None
             raise ValueError(
                 f"Found multiple {len(symbol_candidates)} symbols matching '{name_path_pattern}'. "
-                "They are: \n" + json.dumps([s.to_dict(kind=True, relative_path=include_rel_path) for s in symbol_candidates], indent=2)
+                "They are: \n"
+                + json.dumps(
+                    [
+                        s.to_dict(kind=True, relative_path=include_rel_path, output_paths=self.project.output_paths)
+                        for s in symbol_candidates
+                    ],
+                    indent=2,
+                )
             )
 
     def find_by_location(self, location: LanguageServerSymbolLocation) -> LanguageServerSymbol | None:

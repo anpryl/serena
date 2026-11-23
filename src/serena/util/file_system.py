@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+import hashlib
 import logging
 import os
 import re
@@ -252,6 +253,47 @@ def find_all_non_ignored_files(repo_root: str) -> list[str]:
     return files
 
 
+class FileStateDigest:
+    """
+    Digests of a file's state, by which a change of the file (its contents, its kind or its absence) is detected.
+    """
+
+    UNREADABLE = "unreadable"
+    """the digest of a regular file that cannot be read"""
+
+    @staticmethod
+    def of_contents(contents: bytes) -> str:
+        """
+        :param contents: the contents of a regular file
+        :return: the digest of a regular file with these contents
+        """
+        return "file:" + hashlib.sha256(contents).hexdigest()
+
+    @classmethod
+    def of_path(cls, path: str) -> str:
+        """
+        :param path: the path of a file, which is not followed if it is a symlink; only a regular file is ever read, so
+            that a special file (e.g. a FIFO or a device) can neither block nor make the read unbounded
+        :return: the digest of the file's current state
+        """
+        try:
+            stat_result = os.lstat(path)
+        except OSError:
+            return "missing"
+        if stat.S_ISLNK(stat_result.st_mode):
+            try:
+                return "symlink:" + os.readlink(path)
+            except OSError:
+                return "symlink"
+        if not stat.S_ISREG(stat_result.st_mode):
+            return "special"
+        try:
+            with open(path, "rb") as f:
+                return cls.of_contents(f.read())
+        except OSError:
+            return cls.UNREADABLE
+
+
 @dataclass
 class GitignoreSpec:
     file_path: str
@@ -294,6 +336,8 @@ class GitignoreParser:
         """
         self.repo_root = os.path.abspath(repo_root)
         self.ignore_specs: list[GitignoreSpec] = []
+        self.read_file_digests: dict[str, str] = {}
+        """the digests (see `FileStateDigest`) of the gitignore files read, including those without patterns, by path"""
         self._specs_by_directory: dict[str, list[GitignoreSpec]] = {}
         self._indexed_specs_count = 0
         self._prune_spec = prune_spec
@@ -362,10 +406,16 @@ class GitignoreParser:
         :return: GitignoreSpec object for the gitignore patterns
         """
         try:
-            with open(gitignore_file_path, encoding="utf-8") as f:
-                content = f.read()
-        except (OSError, UnicodeDecodeError):
+            with open(gitignore_file_path, "rb") as f:
+                raw_content = f.read()
+        except OSError:
             # If we can't read the file, return an empty spec
+            self.read_file_digests[gitignore_file_path] = FileStateDigest.UNREADABLE
+            return GitignoreSpec(gitignore_file_path, [])
+        self.read_file_digests[gitignore_file_path] = FileStateDigest.of_contents(raw_content)
+        try:
+            content = raw_content.decode("utf-8")
+        except UnicodeDecodeError:
             return GitignoreSpec(gitignore_file_path, [])
 
         gitignore_dir = os.path.dirname(gitignore_file_path)

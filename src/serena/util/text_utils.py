@@ -18,7 +18,7 @@ from solidlsp.ls_utils import TextCoordinateProvider, TextCoordinates, TextUtils
 
 if TYPE_CHECKING:
     from serena.code_editor import CodeEditor
-    from serena.project import Project
+    from serena.project import OutputPaths, Project
 
 log = logging.getLogger(__name__)
 
@@ -520,7 +520,9 @@ class ReplacementOccurrence:
     """A single prospective replacement of a pattern match within one file."""
 
     occurrence_id: str
-    """stable, content-anchored identifier: '<relative_path>:<index_in_file>@<digest>'"""
+    """stable, content-anchored identifier: '<path>:<index_in_file>@<digest>', where the path is the file's as named by
+    the project's output paths (see `Project.output_paths`), so that an id made under one project root does not resolve
+    under another"""
     relative_path: str
     index_in_file: int
     """0-based index of this match among the matches within its file (in position order)"""
@@ -568,9 +570,18 @@ class MultiFileContentReplacer:
         return hashlib.sha256(text.encode("utf-8")).hexdigest()[: cls._DIGEST_LEN]
 
     @classmethod
-    def make_occurrence_id(cls, relative_path: str, index_in_file: int, content_digest: str, start: int, end: int) -> str:
-        """Creates an identifier bound to the file's content and the matched character range."""
-        return f"{relative_path}:{index_in_file}@{cls._digest(f'{content_digest}:{start}:{end}')}"
+    def make_occurrence_id(cls, output_path: str, index_in_file: int, content_digest: str, start: int, end: int) -> str:
+        """
+        Creates an identifier bound to the file's content and the matched character range.
+
+        :param output_path: the file's path as named by the project's output paths (see `Project.output_paths`)
+        :param index_in_file: the 0-based index of the match among the matches within the file
+        :param content_digest: the digest of the file's content
+        :param start: the character offset of the match start
+        :param end: the character offset of the match end
+        :return: the identifier
+        """
+        return f"{output_path}:{index_in_file}@{cls._digest(f'{content_digest}:{start}:{end}')}"
 
     @staticmethod
     def _expand_backreferences(match: re.Match, repl_template: str) -> str:
@@ -586,18 +597,22 @@ class MultiFileContentReplacer:
 
         return re.sub(r"\$!(\d+)", expand, repl_template)
 
-    def find_occurrences(self, files: list[tuple[str, str]], needle: str, repl: str) -> list[ReplacementOccurrence]:
+    def find_occurrences(
+        self, files: list[tuple[str, str]], needle: str, repl: str, output_paths: "OutputPaths | None" = None
+    ) -> list[ReplacementOccurrence]:
         """
         Finds all matches of the needle in the given files.
 
         :param files: (relative_path, content) pairs; processed in the given order
         :param needle: the search expression (literal string or regex, depending on the mode)
         :param repl: the replacement template (may contain $!N backreferences in regex mode)
+        :param output_paths: the paths by which the occurrence ids name the files; if None, by their relative paths
         :return: occurrences in deterministic order (file order, then position within the file)
         """
         pattern = self._compile(needle)
         occurrences: list[ReplacementOccurrence] = []
         for relative_path, content in files:
+            id_path = output_paths.of(relative_path) if output_paths is not None else relative_path
             content_digest = self._digest(content)
             for index_in_file, match in enumerate(pattern.finditer(content)):
                 matched_text = match.group(0)
@@ -616,7 +631,7 @@ class MultiFileContentReplacer:
 
                 occurrences.append(
                     ReplacementOccurrence(
-                        occurrence_id=self.make_occurrence_id(relative_path, index_in_file, content_digest, match.start(), match.end()),
+                        occurrence_id=self.make_occurrence_id(id_path, index_in_file, content_digest, match.start(), match.end()),
                         relative_path=relative_path,
                         index_in_file=index_in_file,
                         start=match.start(),
@@ -727,7 +742,7 @@ class MultiFileReplacementResult:
     """
 
     num_occurrences_by_file: dict[str, int]
-    """the number of replaced occurrences per file (relative path), in application order"""
+    """the number of replaced occurrences per file (named by the project's output paths), in application order"""
 
     @property
     def num_occurrences(self) -> int:
@@ -767,9 +782,10 @@ class MultiFileReplacement:
         self._replacer = MultiFileContentReplacer(mode=mode)
         self._needle = needle
         self._repl = repl
+        self._output_paths = project.output_paths
         files = self._collect_files(project, relative_path.strip(), paths_include_glob.strip(), paths_exclude_glob.strip())
         self._contents = dict(files)
-        self.occurrences: list[ReplacementOccurrence] = self._replacer.find_occurrences(files, needle, repl)
+        self.occurrences: list[ReplacementOccurrence] = self._replacer.find_occurrences(files, needle, repl, self._output_paths)
 
     @staticmethod
     def _collect_files(project: "Project", relative_path: str, paths_include_glob: str, paths_exclude_glob: str) -> list[tuple[str, str]]:
@@ -807,7 +823,7 @@ class MultiFileReplacement:
         occurrences_by_id = {o.occurrence_id: o for o in self.occurrences}
         indices_by_path: dict[str, set[int]] = {}
         for o in self.occurrences:
-            indices_by_path.setdefault(o.relative_path, set()).add(o.index_in_file)
+            indices_by_path.setdefault(self._output_paths.of(o.relative_path), set()).add(o.index_in_file)
 
         # resolve each id, diagnosing failures
         selected: dict[str, ReplacementOccurrence] = {}
@@ -820,6 +836,8 @@ class MultiFileReplacement:
             id_match = MultiFileContentReplacer.OCCURRENCE_ID_REGEX.match(oid)
             if id_match is None:
                 problems.append(f"{oid}: malformed id (expected '<path>:<index>@<digest>' as returned by a dry run)")
+            elif not self._output_paths.names_own_file(id_match.group("path")):
+                problems.append(f"{oid}: the id was made under another project root (a dry run in another worktree)")
             elif id_match.group("path") not in indices_by_path:
                 problems.append(f"{oid}: the pattern currently has no matches in this file")
             elif int(id_match.group("index")) not in indices_by_path[id_match.group("path")]:
@@ -896,7 +914,7 @@ class MultiFileReplacement:
         parts = [header]
         for path in affected_files:
             file_occurrences = [o for o in self.occurrences if o.relative_path == path]
-            parts.append(f"\n{path} ({len(file_occurrences)} occurrence(s)):")
+            parts.append(f"\n{self._output_paths.of(path)} ({len(file_occurrences)} occurrence(s)):")
             for occ in file_occurrences:
                 parts.append(self._replacer.render_occurrence_diff(occ, self._contents[path]))
         result = "\n".join(parts)
@@ -906,7 +924,7 @@ class MultiFileReplacement:
             return "\n".join([header] + [f"  [{o.occurrence_id}] line {o.start_line}" for o in self.occurrences])
 
         def make_per_file_counts() -> str:
-            counts = {path: sum(1 for o in self.occurrences if o.relative_path == path) for path in affected_files}
+            counts = {self._output_paths.of(path): sum(1 for o in self.occurrences if o.relative_path == path) for path in affected_files}
             return f"{header}\nOccurrence counts per file:\n{TextOutputUtils.to_json(counts)}"
 
         def make_summary() -> str:
@@ -938,18 +956,19 @@ class MultiFileReplacement:
                     # the editor's view differs from what was scanned (e.g. line-ending normalization);
                     # re-derive the occurrences from the authoritative content and re-validate by id
                     fresh_by_id = {
-                        o.occurrence_id: o for o in self._replacer.find_occurrences([(path, original_content)], self._needle, self._repl)
+                        o.occurrence_id: o
+                        for o in self._replacer.find_occurrences([(path, original_content)], self._needle, self._repl, self._output_paths)
                     }
                     try:
                         file_occurrences = [fresh_by_id[o.occurrence_id] for o in file_occurrences]
                     except KeyError as e:
                         raise ValueError(
-                            f"The content of {path} changed while replacing (occurrence {e} no longer resolves); "
+                            f"The content of {self._output_paths.of(path)} changed while replacing (occurrence {e} no longer resolves); "
                             f"the file was NOT modified. Re-run with dry_run=True for current ids."
                         ) from e
                 context.set_updated_content(self._replacer.apply_to_content(original_content, file_occurrences))
 
-        return MultiFileReplacementResult({path: len(occs) for path, occs in occurrences_by_file.items()})
+        return MultiFileReplacementResult({self._output_paths.of(path): len(occs) for path, occs in occurrences_by_file.items()})
 
 
 def find_text_coordinates(content: str, regex: str, require_unique: bool = False) -> TextCoordinates | None:

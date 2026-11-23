@@ -96,9 +96,14 @@ class GroupedDiagnostics:
     def __init__(self) -> None:
         self._grouped_diagnostics: dict[str, dict[str, dict[str, list[dict[str, Any]]]]] = {}
 
-    def add(self, relative_path: str, name_path: str, diagnostic: ls_types.Diagnostic) -> None:
+    def add(self, file_path: str, name_path: str, diagnostic: ls_types.Diagnostic) -> None:
+        """
+        :param file_path: the path by which results name the file containing the diagnostic
+        :param name_path: the name path of the symbol that owns the diagnostic
+        :param diagnostic: the diagnostic
+        """
         severity_name = self._diagnostic_severity_name(diagnostic.get("severity"))
-        self._grouped_diagnostics.setdefault(relative_path, {}).setdefault(severity_name, {}).setdefault(name_path, []).append(
+        self._grouped_diagnostics.setdefault(file_path, {}).setdefault(severity_name, {}).setdefault(name_path, []).append(
             self._diagnostic_output_dict(diagnostic)
         )
 
@@ -106,7 +111,7 @@ class GroupedDiagnostics:
         """
         Returns a nested dictionary of the form:
         {
-            relative_file_path: {
+            file_path: {
                 severity_name: {
                     name_path: [
                         diagnostic_dict,
@@ -119,7 +124,7 @@ class GroupedDiagnostics:
             ...
         }
         where:
-        - relative_file_path is the relative path of the file containing the diagnostic
+        - file_path is the path by which the file containing the diagnostic was added (see `add`)
         - severity_name is the name of the diagnostic severity (e.g. "Warning", "Error")
         - name_path is the name path of the symbol that owns the diagnostic (or "<file>" if no owner symbol was found)
         - diagnostic_dict is a dictionary containing the diagnostic's message, range, and optionally code and source
@@ -199,7 +204,9 @@ class DiagnosticsDiff:
                     column=diagnostic_start["character"],
                 )
                 name_path = owner_symbol.get_name_path() if owner_symbol is not None else "<file>"
-                grouped_diagnostics.add(edited_file_path.after_relative_path, name_path, diagnostic)
+                grouped_diagnostics.add(
+                    symbol_retriever.project.output_paths.of(edited_file_path.after_relative_path), name_path, diagnostic
+                )
 
         self._grouped_diagnostics = grouped_diagnostics
 

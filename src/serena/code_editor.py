@@ -85,7 +85,7 @@ class CodeEditor(Generic[TSymbol], ABC):
         Context manager for editing a file.
         """
         if FileProxy.is_external_path(relative_path, self.project):
-            raise ValueError(f"Cannot edit external file: {relative_path}")
+            raise ValueError(f"Cannot edit external file: {self.project.output_paths.of(relative_path)}")
         with self._open_file_context(relative_path) as edited_file:
             yield edited_file
             # save the file

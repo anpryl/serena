@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from serena.code_editor import LanguageServerCodeEditor
 from serena.lsp.lsp_diagnostics import GroupedDiagnostics
+from serena.project import OutputPaths
 from serena.symbol import (
     LanguageServerSymbol,
     LanguageServerSymbolDictGrouper,
@@ -65,10 +66,19 @@ class LspSymbolCollection(RepresentableViaRenderer):
     def __len__(self) -> int:
         return len(self.symbols)
 
-    def relative_path_to_name_paths_(self) -> dict[str, list[str]]:
+    def relative_path_to_name_paths_(self, output_paths: OutputPaths | None = None) -> dict[str, list[str]]:
+        """
+        :param output_paths: the paths by which to name the files; if None, they are named by their relative paths
+        :return: the name paths of the symbols, by file
+        """
         result: defaultdict[str, list[str]] = defaultdict(list)
         for s in self.symbols:
-            result[s.location.relative_path or "unknown"].append(s.get_name_path())
+            relative_path = s.location.relative_path
+            if relative_path is None:
+                key = "unknown"
+            else:
+                key = output_paths.of(relative_path) if output_paths is not None else relative_path
+            result[key].append(s.get_name_path())
         return result
 
 
@@ -118,10 +128,15 @@ class LspSymbolCollectionRenderer(Renderer[LspSymbolCollection]):
         agent: "SerenaAgent",
         max_answer_chars: int,
         output_params: SymbolOutputParams,
+        output_paths: OutputPaths,
         grouper: SymbolDictGrouper | None = None,
     ):
+        """
+        :param output_paths: the paths by which to name the symbols' files
+        """
         super().__init__(agent, max_answer_chars)
         self._output_params = output_params
+        self._output_paths = output_paths
         self._grouper = grouper
 
     def symbol_dicts_(
@@ -147,6 +162,7 @@ class LspSymbolCollectionRenderer(Renderer[LspSymbolCollection]):
                 children_name=p.children_name,
                 children_name_path=p.children_name_path,
                 child_inclusion_predicate=p.child_inclusion_predicate,
+                output_paths=self._output_paths,
             )
             for s in symbols
         ]
@@ -163,7 +179,7 @@ class LspSymbolCollectionRenderer(Renderer[LspSymbolCollection]):
 
     def render(self, obj: LspSymbolCollection) -> str:
         def create_short_result_relative_path_to_name_paths() -> str:
-            return f"Shortened result:\n{TextOutputUtils.to_json(obj.relative_path_to_name_paths_())}"
+            return f"Shortened result:\n{TextOutputUtils.to_json(obj.relative_path_to_name_paths_(self._output_paths))}"
 
         result = self._to_json(self._group(self.symbol_dicts_(obj.symbols, obj.info_by_symbol_)))
         return self._limit_length(result, shortened_result_factories=[create_short_result_relative_path_to_name_paths])
@@ -244,15 +260,21 @@ class LspReferenceCollectionRenderer(Renderer[LspReferenceCollection]):
     references without code, per-file counts and finally the total count if the length limit is exceeded.
     """
 
-    def __init__(self, agent: "SerenaAgent", max_answer_chars: int, grouper: SymbolDictGrouper):
+    def __init__(self, agent: "SerenaAgent", max_answer_chars: int, output_paths: OutputPaths, grouper: SymbolDictGrouper):
+        """
+        :param output_paths: the paths by which to name the referencing symbols' files
+        """
         super().__init__(agent, max_answer_chars)
+        self._output_paths = output_paths
         self._grouper = grouper
 
     def render(self, obj: LspReferenceCollection) -> str:
         reference_dicts = []
         ref_summaries = []
         for ref, content_around_ref in zip(obj.references, obj.contents_around_references_, strict=True):
-            ref_dict = dict(ref.symbol.to_dict(kind=True, relative_path=True, depth=0, body=False, body_location=True))
+            ref_dict = dict(
+                ref.symbol.to_dict(kind=True, relative_path=True, depth=0, body=False, body_location=True, output_paths=self._output_paths)
+            )
             ref_dict["content_around_reference"] = content_around_ref
             reference_dicts.append(ref_dict)
             ref_summaries.append(
@@ -282,7 +304,8 @@ class LspReferenceCollectionRenderer(Renderer[LspReferenceCollection]):
 
 class LspDiagnostics(RepresentableViaRenderer):
     """
-    Diagnostics grouped as `relative_path -> severity -> name_path -> diagnostics`; see `grouped.get_dict()`.
+    Diagnostics grouped as `file_path -> severity -> name_path -> diagnostics`, files being named by the project's output
+    paths (see `Project.output_paths`); see `grouped.get_dict()`.
     """
 
     grouped: GroupedDiagnostics
@@ -415,14 +438,15 @@ class LspApi(FacadeApi):
         symbol_retriever = self._create_symbol_retriever()
 
         # the symbol overview is capable of working with both files and directories, but we require a file
+        output_paths = self._get_project().output_paths
         file_path = os.path.join(self._get_project().project_root, relative_path)
         if not os.path.exists(file_path):
-            raise FileNotFoundError(f"File or directory {relative_path} does not exist in the project.")
+            raise FileNotFoundError(f"File or directory {output_paths.of(relative_path)} does not exist in the project.")
         if os.path.isdir(file_path):
-            raise ValueError(f"Expected a file path, but got a directory path: {relative_path}. ")
+            raise ValueError(f"Expected a file path, but got a directory path: {output_paths.of(relative_path)}. ")
         if not symbol_retriever.can_analyze_file(relative_path):
             raise ValueError(
-                f"Cannot extract symbols from file {relative_path}. "
+                f"Cannot extract symbols from file {output_paths.of(relative_path)}. "
                 f"Active language servers: {[l.get_key() for l in self._agent.get_active_language_server_ids()]}"
             )
 
@@ -436,7 +460,9 @@ class LspApi(FacadeApi):
             location=False,
             child_inclusion_predicate=_is_not_low_level,
         )
-        renderer = LspSymbolsOverviewRenderer(self._agent, max_answer_chars, output_params, grouper=self.overview_grouper_)
+        renderer = LspSymbolsOverviewRenderer(
+            self._agent, max_answer_chars, output_params, self._get_project().output_paths, grouper=self.overview_grouper_
+        )
         return LspSymbolCollection(symbols, renderer)
 
     @facade_method(uses_project_server=True, corresponding_tool=FindSymbolTool)
@@ -521,14 +547,17 @@ class LspApi(FacadeApi):
             children_name_path=False,
             include_info=include_info,
         )
-        renderer = LspSymbolCollectionRenderer(self._agent, max_answer_chars, output_params, grouper=self.find_symbol_dict_grouper_)
+        renderer = LspSymbolCollectionRenderer(
+            self._agent, max_answer_chars, output_params, self._get_project().output_paths, grouper=self.find_symbol_dict_grouper_
+        )
         symbol_collection = LspSymbolCollection(symbols, renderer, self._request_info(symbol_retriever, symbols, output_params))
 
         # check for max_matches limit exceeded
         n_matches = len(symbols)
         if 0 < max_matches < n_matches:
             raise ValueError(
-                f"Matched {n_matches}>{max_matches=} symbols.\n" + TextOutputUtils.to_json(symbol_collection.relative_path_to_name_paths_())
+                f"Matched {n_matches}>{max_matches=} symbols.\n"
+                + TextOutputUtils.to_json(symbol_collection.relative_path_to_name_paths_(self._get_project().output_paths))
             )
 
         return symbol_collection
@@ -568,7 +597,7 @@ class LspApi(FacadeApi):
             exclude_kinds=self._parse_kinds(exclude_kinds),
         )
         contents_around_references = [self._retrieve_content_around_reference(ref) for ref in references]
-        renderer = LspReferenceCollectionRenderer(self._agent, max_answer_chars, self.references_grouper_)
+        renderer = LspReferenceCollectionRenderer(self._agent, max_answer_chars, self._get_project().output_paths, self.references_grouper_)
         return LspReferenceCollection(references, contents_around_references, renderer)
 
     @facade_method(uses_project_server=True, corresponding_tool=FindImplementationsTool)
@@ -605,7 +634,7 @@ class LspApi(FacadeApi):
             exclude_kinds=self._parse_kinds(exclude_kinds),
         )
         output_params = SymbolOutputParams(kind=True, relative_path=True, body_location=True, include_info=include_info)
-        renderer = LspSymbolCollectionRenderer(self._agent, max_answer_chars, output_params)
+        renderer = LspSymbolCollectionRenderer(self._agent, max_answer_chars, output_params, self._get_project().output_paths)
         return LspSymbolCollection(symbols, renderer, self._request_info(symbol_retriever, symbols, output_params))
 
     @facade_method(uses_project_server=True, corresponding_tool=FindDeclarationTool)
@@ -655,13 +684,13 @@ class LspApi(FacadeApi):
         )
         if defining_symbol is None:
             raise ValueError(
-                f"No symbol declaration found at the location of the regex match. Location: {relative_path}:{coords.line}:{coords.col}."
+                f"No symbol declaration found at the location of the regex match. Location: {self._get_project().output_paths.of(relative_path)}:{coords.line}:{coords.col}."
             )
 
         output_params = SymbolOutputParams(
             kind=True, relative_path=True, body_location=True, include_body=include_body, include_info=include_info
         )
-        collection_renderer = LspSymbolCollectionRenderer(self._agent, -1, output_params)
+        collection_renderer = LspSymbolCollectionRenderer(self._agent, -1, output_params, self._get_project().output_paths)
         info = self._request_info(symbol_retriever, [defining_symbol], output_params).get(defining_symbol)
         return LspSymbol(defining_symbol, LspSymbolRenderer(self._agent, -1, collection_renderer), info)
 
@@ -672,7 +701,7 @@ class LspApi(FacadeApi):
         """
         Gets diagnostics for a file.
 
-        Diagnostics are grouped as `relative_path -> severity -> name_path -> diagnostics_results`.
+        Diagnostics are grouped as `file_path -> severity -> name_path -> diagnostics_results` (see `LspDiagnostics`).
         If a diagnostic cannot be mapped to a symbol, it is grouped under the special name path `<file>`.
 
         :param relative_path: the relative path to the file to inspect.
@@ -697,7 +726,7 @@ class LspApi(FacadeApi):
                 relative_file_path=relative_path, line=diag_start["line"], column=diag_start["character"]
             )
             name_path = owner_symbol.get_name_path() if owner_symbol is not None else self.FILE_LEVEL_DIAGNOSTIC_BUCKET
-            grouped_diagnostics.add(relative_path, name_path, diagnostic)
+            grouped_diagnostics.add(self._get_project().output_paths.of(relative_path), name_path, diagnostic)
 
         return self._create_diagnostics(grouped_diagnostics, max_answer_chars)
 
@@ -714,7 +743,7 @@ class LspApi(FacadeApi):
         Gets diagnostics for the specified symbol.
 
         When `check_symbol_references` is true, diagnostics for all referencing symbols are also included.
-        The result is grouped as `relative_path -> severity -> name_path -> diagnostics_results`.
+        The result is grouped as `file_path -> severity -> name_path -> diagnostics_results` (see `LspDiagnostics`).
 
         :param name_path: the name path of the symbol to inspect.
         :param reference_file: optional file path used to disambiguate the symbol search.
@@ -742,7 +771,7 @@ class LspApi(FacadeApi):
             if relative_path is None:
                 continue
             for diagnostic in diagnostics:
-                grouped_diagnostics.add(relative_path, symbol.get_name_path(), diagnostic)
+                grouped_diagnostics.add(self._get_project().output_paths.of(relative_path), symbol.get_name_path(), diagnostic)
 
         return self._create_diagnostics(grouped_diagnostics, max_answer_chars)
 
@@ -781,7 +810,9 @@ class LspApi(FacadeApi):
         symbol = symbol_retriever.find_unique(name_path_pattern, substring_matching=False, within_relative_path=relative_path)
         symbol_rel_path = symbol.relative_path
         assert symbol_rel_path is not None, f"Symbol {name_path_pattern} has no relative path, this is likely a bug."
-        assert symbol_rel_path == relative_path, f"Symbol {name_path_pattern} is not in the expected relative path {relative_path}."
+        assert symbol_rel_path == relative_path, (
+            f"Symbol {name_path_pattern} is not in the expected file {self._get_project().output_paths.of(relative_path)}."
+        )
         symbol_name_path = symbol.get_name_path()
 
         # check for references
@@ -797,7 +828,7 @@ class LspApi(FacadeApi):
             ref_relative_path = ref_loc.get("relativePath")
             if ref_relative_path is None:
                 continue
-            file_to_lines[ref_relative_path].append(ref_loc["range"]["start"]["line"])
+            file_to_lines[self._get_project().output_paths.of(ref_relative_path)].append(ref_loc["range"]["start"]["line"])
         if file_to_lines:
             return f"Cannot delete, the symbol {symbol_name_path} is referenced in: {TextOutputUtils.to_json(file_to_lines)}"
 

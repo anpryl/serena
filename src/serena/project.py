@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -59,6 +60,34 @@ def merge_ls_specific_settings(global_settings: dict, project_settings: dict) ->
     return merged_settings
 
 
+@dataclass(frozen=True)
+class OutputPaths:
+    """
+    The paths by which results name a project's files: relative to the project root, or absolute under it.
+    """
+
+    absolute_root: str | None
+    """the project root, under which results name files by absolute path; None if they name them by relative path"""
+
+    def of(self, relative_path: str) -> str:
+        """
+        :param relative_path: the path of a file or directory, relative to the project root
+        :return: the path by which results name the file or directory
+        """
+        if self.absolute_root is None:
+            return relative_path
+        return os.path.normpath(os.path.join(self.absolute_root, relative_path))
+
+    def names_own_file(self, output_path: str) -> bool:
+        """
+        :param output_path: a path as named by results
+        :return: whether the path is of the form these output paths produce (and could thus name a file of the project)
+        """
+        if self.absolute_root is None:
+            return not os.path.isabs(output_path)
+        return os.path.normpath(output_path).startswith(os.path.join(self.absolute_root, ""))
+
+
 class Project(ToStringMixin):
     def __init__(
         self,
@@ -67,15 +96,20 @@ class Project(ToStringMixin):
         project_config: ProjectConfig,
         serena_config: SerenaConfig,
         is_newly_created: bool = False,
+        absolute_output_paths: bool = False,
     ):
         """
         :param project_root: path to the project's root folder; it is assumed to be fully resolved
         :param project_config: the project's configuration
         :param serena_config: the global Serena configuration
         :param is_newly_created: whether the project was newly created
+        :param absolute_output_paths: whether results name the project's files by absolute path (see :attr:`output_paths`)
+            instead of relative to the project root
         """
         assert serena_config is not None
         self.project_root = project_root
+        self.output_paths = OutputPaths(absolute_root=project_root if absolute_output_paths else None)
+        """the paths by which results name the project's files"""
         self.project_config = project_config
         self.serena_config = serena_config
         self._serena_data_folder = serena_config.get_project_serena_folder(self.project_root)
@@ -109,6 +143,7 @@ class Project(ToStringMixin):
         # prepare ignore spec asynchronously, ensuring immediate project activation.
         self.__ignored_patterns: list[str] | None = None
         self.__ignore_spec: pathspec.PathSpec | None = None
+        self.__read_ignore_file_digests: dict[str, str] = {}
         self._ignore_spec_available = threading.Event()
         threading.Thread(name=f"gather-ignorespec[{self.project_config.project_name}]", target=self._gather_ignorespec, daemon=True).start()
 
@@ -139,6 +174,7 @@ class Project(ToStringMixin):
                     # .gitignore rules under such a directory could never change a verdict anyway).
                     prune_spec = pathspec.PathSpec.from_lines(pathspec.patterns.GitWildMatchPattern, configured_patterns)
                     gitignore_parser = GitignoreParser(self.project_root, prune_spec=prune_spec)
+                    self.__read_ignore_file_digests = dict(gitignore_parser.read_file_digests)
                     for spec in gitignore_parser.get_ignore_specs():
                         log.debug(f"Adding {len(spec.patterns)} patterns from {spec.file_path} to the ignored paths.")
                         ignored_patterns.extend(spec.patterns)
@@ -156,6 +192,14 @@ class Project(ToStringMixin):
                 log.error(f"Error while gathering ignore spec for project {self.project_config.project_name}: {e}", exc_info=e)
 
         self._ignore_spec_available.set()
+
+    def get_read_ignore_file_digests(self) -> dict[str, str]:
+        """
+        :return: the digests (see `FileStateDigest`) of the ignore files read to build the project's ignore rules, as read,
+            by path, once the rules are built
+        """
+        self._ignore_spec_available.wait()
+        return dict(self.__read_ignore_file_digests)
 
     def _tostring_includes(self) -> list[str]:
         return []
@@ -343,7 +387,7 @@ class Project(ToStringMixin):
         """
         abs_path = os.path.join(self.project_root, relative_path)
         if not self.is_path_in_project(abs_path):
-            raise ValueError(f"Path {relative_path} points outside the project root ({self.project_root})")
+            raise ValueError(f"Path {self.output_paths.of(relative_path)} points outside the project root ({self.project_root})")
 
         follow_links = self.is_trusted()
 
@@ -463,11 +507,11 @@ class Project(ToStringMixin):
             return
 
         if not self.is_path_in_project(relative_path):
-            raise ValueError(f"{relative_path=} points outside the project root ({self.project_root})")
+            raise ValueError(f"relative_path={self.output_paths.of(relative_path)!r} points outside the project root ({self.project_root})")
 
         if require_not_ignored:
             if self.is_ignored_path(relative_path):
-                raise ValueError(f"Path {relative_path} is ignored")
+                raise ValueError(f"Path {self.output_paths.of(relative_path)} is ignored")
 
     class ProjectFile(ToStringMixin):
         def __init__(self, dir_entry: os.DirEntry, rel_path: str):
@@ -516,7 +560,7 @@ class Project(ToStringMixin):
         """
         start_path = os.path.join(self.project_root, relative_path)
         if not self.is_path_in_project(start_path):
-            raise ValueError(f"Path {relative_path} points outside the project root ({self.project_root})")
+            raise ValueError(f"Path {self.output_paths.of(relative_path)} points outside the project root ({self.project_root})")
         if not os.path.exists(start_path):
             raise FileNotFoundError(f"Root directory {start_path} not found.")
 
