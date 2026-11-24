@@ -251,6 +251,12 @@ trusted_project_path_patterns: []
 # Keep this value private. When missing, null, or empty, a random UUID is generated and saved on load.
 auth_secret:
 
+# whether Serena is forbidden from writing this file. If true, changes that would be persisted
+# (migrations, a generated auth_secret, the dashboard's open-on-launch preference, project registrations)
+# stay in memory, and `serena init` and the dashboard's config editor fail.
+# The value in the file is re-read right before every write, so it also holds for running processes.
+read_only_config: false
+
 # whether Serena keeps a persistent registry of projects in the `projects` list below.
 # If false, the list is neither read nor written (it may be omitted), projects exist in memory only,
 # a project can be activated by path but not by the name of a project this process has not activated,

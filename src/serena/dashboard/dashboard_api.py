@@ -763,6 +763,7 @@ class SerenaDashboardAPI:
             config_path = self._agent.serena_config.config_file_path
             if config_path is None:
                 raise ValueError("Serena config file path not set")
+            self._agent.serena_config.ensure_config_file_writable()
 
             with open(config_path, "w", encoding="utf-8") as f:
                 f.write(request_save_config.content)

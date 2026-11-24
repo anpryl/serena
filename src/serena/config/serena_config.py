@@ -215,6 +215,10 @@ class SerenaConfigError(Exception):
     pass
 
 
+class ConfigFileReadOnlyError(SerenaConfigError):
+    pass
+
+
 DEFAULT_PROJECT_SERENA_FOLDER_LOCATION = "$projectDir/" + SERENA_MANAGED_DIR_NAME
 """
 The default template for the project Serena folder location.
@@ -809,6 +813,13 @@ class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
     If False, the list is neither read nor written, projects exist in memory only, names resolve only
     for projects activated by this process, and cross-project queries are unavailable.
     """
+    read_only_config: bool = False
+    """
+    whether Serena is forbidden from writing the configuration file. If True, changes that would be persisted
+    (migrations, a generated ``auth_secret``, the dashboard's open-on-launch preference, project registrations)
+    stay in memory, and explicit attempts to edit the file fail. The value stored in the file is authoritative
+    at the time of each write, see :meth:`is_config_file_writable`.
+    """
     projects: list[RegisteredProject] = field(default_factory=list)
     auth_secret: str = field(default_factory=lambda: str(uuid4()), repr=False)
     """
@@ -1111,8 +1122,11 @@ class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
 
         # re-save the configuration file if any migrations were performed
         if num_migrations > 0:
-            log.info("Legacy configuration was migrated; re-saving configuration file")
-            instance._save()
+            if instance.is_config_file_writable():
+                log.info("Legacy configuration was migrated; re-saving configuration file")
+                instance._save()
+            else:
+                log.info("Legacy configuration was migrated in memory only (the configuration file is read-only)")
 
         return instance
 
@@ -1339,10 +1353,13 @@ class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
         """Save the dashboard launch preference without persisting transient configuration overrides."""
         # persist against the latest disk configuration under the shared file lock
         if self.config_file_path is not None:
-            with FileLock(self.config_file_path + ".lock"):
-                persisted = SerenaConfig.from_config_file()
-                persisted.web_dashboard_open_on_launch = value
-                persisted._save()
+            if self.is_config_file_writable():
+                with FileLock(self.config_file_path + ".lock"):
+                    persisted = SerenaConfig.from_config_file()
+                    persisted.web_dashboard_open_on_launch = value
+                    persisted._save()
+            else:
+                log.info("Not persisting the dashboard launch preference (the configuration file is read-only)")
 
         # update the running configuration only after persistence succeeds
         self.web_dashboard_open_on_launch = value
@@ -1362,6 +1379,9 @@ class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
         process's change was not yet on disk when the other one read.
         """
         if self.config_file_path is None or not self.project_registry:
+            return
+        if not self.is_config_file_writable():
+            log.info("Not persisting project-list changes (the configuration file is read-only)")
             return
 
         with FileLock(self.config_file_path + ".lock"):
@@ -1387,6 +1407,34 @@ class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
             persisted._save()
             self._projects_at_load = current_paths
 
+    def is_config_file_writable(self) -> bool:
+        """
+        Decides whether this process may write the configuration file.
+
+        The file is not writable if the running value of ``read_only_config`` is set, if the value stored in the
+        file on disk is set (the file may have changed since it was loaded), or if the file cannot be read or parsed.
+
+        :return: whether the configuration file may be written
+        """
+        if self.read_only_config:
+            return False
+        if self.config_file_path is None:
+            return True
+        try:
+            return not load_yaml(self.config_file_path).get("read_only_config", False)
+        except Exception:
+            return False
+
+    def ensure_config_file_writable(self) -> None:
+        """
+        :raises ConfigFileReadOnlyError: if :meth:`is_config_file_writable` is False
+        """
+        if not self.is_config_file_writable():
+            raise ConfigFileReadOnlyError(
+                f"Refusing to write the Serena configuration file {self.config_file_path}: "
+                "`read_only_config` is set (or the file cannot be read)."
+            )
+
     def _save(self) -> None:
         """
         Saves the full configuration to the file from which it was loaded (if any)
@@ -1397,6 +1445,7 @@ class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
         """
         if self.config_file_path is None:
             return
+        self.ensure_config_file_writable()
 
         assert self._loaded_commented_yaml is not None, "Cannot save configuration without loaded YAML"
 

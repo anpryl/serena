@@ -27,6 +27,7 @@ from serena.config.client_setup import client_setup_handlers
 from serena.config.context_mode import SerenaAgentContext, SerenaAgentMode
 from serena.config.serena_config import (
     AgentInterface,
+    ConfigFileReadOnlyError,
     ModeSelectionDefinition,
     ModeSelectionDefinitionWithAddedModes,
     ProjectConfig,
@@ -197,7 +198,10 @@ class TopLevelCommands(AutoRegisteringGroup):
     )
     def init(language_backend: Literal["LSP", "JetBrains"] = "LSP") -> None:
         click.echo(f"\nSerena version: {serena_version()}\n")
-        serena_config = SerenaConfig.init(builtin_language_backend=BuiltinLanguageBackend(language_backend))
+        try:
+            serena_config = SerenaConfig.init(builtin_language_backend=BuiltinLanguageBackend(language_backend))
+        except ConfigFileReadOnlyError as e:
+            raise click.ClickException(str(e)) from e
         click.echo(f"Configuration file: {serena_config.config_file_path}")
         click.echo(f"Language backend: {language_backend}")
 
