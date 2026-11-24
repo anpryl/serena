@@ -5,6 +5,7 @@ Language server-related tools
 
 from typing import TYPE_CHECKING, cast
 
+from serena.outcome_reports import SymbolLookupOutcome
 from serena.symbol import SymbolDictGrouper
 from serena.tools import (
     EditingToolWithDiagnostics,
@@ -133,22 +134,20 @@ class FindSymbolTool(Tool, ToolMarkerSymbolicRead, LspApiMixin):
         :param max_answer_chars: max result length; -1 for default
         :return: symbols (with locations) matching the name.
         """
-        return (
-            self._api()
-            .find_symbol(
-                name_path_pattern,
-                depth=depth,
-                relative_path=relative_path,
-                include_body=include_body,
-                include_info=include_info,
-                include_kinds=include_kinds,
-                exclude_kinds=exclude_kinds,
-                substring_matching=substring_matching,
-                max_matches=max_matches,
-                max_answer_chars=max_answer_chars,
-            )
-            .represent()
+        symbols = self._api().find_symbol(
+            name_path_pattern,
+            depth=depth,
+            relative_path=relative_path,
+            include_body=include_body,
+            include_info=include_info,
+            include_kinds=include_kinds,
+            exclude_kinds=exclude_kinds,
+            substring_matching=substring_matching,
+            max_matches=max_matches,
+            max_answer_chars=max_answer_chars,
         )
+        hint = SymbolLookupOutcome(name_path_pattern, relative_path or "", len(symbols)).hint()
+        return symbols.represent() + hint
 
     @classmethod
     def get_param_aliases(cls) -> dict[str, str]:

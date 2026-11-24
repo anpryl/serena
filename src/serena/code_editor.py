@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator, Reversible
 from contextlib import contextmanager
@@ -10,6 +11,7 @@ from types import TracebackType
 from typing import Any, Generic, Self, TypeVar, cast
 
 from serena.jetbrains.jetbrains_plugin_client import JetBrainsPluginClient, ServerNotFoundError
+from serena.outcome_reports import RenameOutcome
 from serena.symbol import JetBrainsSymbol, LanguageServerSymbol, LanguageServerSymbolRetriever, PositionInFile, Symbol
 from solidlsp import SolidLanguageServer, ls_types
 from solidlsp.ls import LSPFileBuffer
@@ -351,11 +353,22 @@ class LanguageServerCodeEditor(CodeEditor[LanguageServerSymbol]):
         def apply(self) -> None:
             pass
 
+        @property
+        @abstractmethod
+        def changed_relative_paths(self) -> list[str]:
+            """
+            :return: the files this operation changes, relative to the project root
+            """
+
     class EditOperationFileTextEdits(EditOperation):
         def __init__(self, code_editor: "LanguageServerCodeEditor", file_uri: str, text_edits: list[ls_types.TextEdit]):
             self._code_editor = code_editor
             self._relative_path = code_editor._relative_path_from_uri(file_uri)
             self._text_edits = text_edits
+
+        @property
+        def changed_relative_paths(self) -> list[str]:
+            return [self._relative_path]
 
         def apply(self) -> None:
             with self._code_editor.edited_file_context(self._relative_path) as edited_file:
@@ -367,6 +380,10 @@ class LanguageServerCodeEditor(CodeEditor[LanguageServerSymbol]):
             self._code_editor = code_editor
             self._old_relative_path = code_editor._relative_path_from_uri(old_uri)
             self._new_relative_path = code_editor._relative_path_from_uri(new_uri)
+
+        @property
+        def changed_relative_paths(self) -> list[str]:
+            return [self._old_relative_path, self._new_relative_path]
 
         def apply(self) -> None:
             old_abs_path = os.path.join(self._code_editor.project_root, self._old_relative_path)
@@ -432,15 +449,50 @@ class LanguageServerCodeEditor(CodeEditor[LanguageServerSymbol]):
                 f"Language server for {lang_server.language_id} returned no rename edits for symbol '{name_path}'. "
                 f"The symbol might not support renaming."
             )
-        num_changes = self._apply_workspace_edit(rename_result)
+        n_other_uses = self._count_other_uses(lang_server, relative_path, symbol)
+        operations = self._workspace_edit_to_edit_operations(rename_result)
+        for operation in operations:
+            operation.apply()
+        num_changes = len(operations)
 
         if num_changes == 0:
             raise ValueError(
                 f"Renaming symbol '{name_path}' to '{new_name}' resulted in no changes being applied; renaming may not be supported."
             )
 
-        msg = f"Successfully renamed '{name_path}' to '{new_name}' ({num_changes} changes applied)"
-        return msg
+        changed_files = tuple(dict.fromkeys(path for operation in operations for path in operation.changed_relative_paths))
+        return RenameOutcome(
+            name_path=name_path,
+            new_name=new_name,
+            changed_files=changed_files,
+            n_changes=num_changes,
+            declaration_file=relative_path,
+            n_other_uses=n_other_uses,
+        ).message()
+
+    def _count_other_uses(self, lang_server: SolidLanguageServer, relative_path: str, symbol: LanguageServerSymbol) -> int:
+        """
+        :return: the number of references to the symbol outside its declaration that the language server reports; if
+            it reports none, the number of other source files of the same type in which the symbol's name occurs as a
+            word (a server that does not know the project's other files reports no references)
+        """
+        line, column = symbol.location.line, symbol.location.column
+        assert line is not None and column is not None
+        count = 0
+        for location in lang_server.request_references(relative_path, line, column) or []:
+            start = location["range"]["start"]
+            if location.get("relativePath") == relative_path and (start["line"], start["character"]) == (line, column):
+                continue
+            count += 1
+        if count > 0:
+            return count
+        word = re.compile(rf"\b{re.escape(symbol.name)}\b")
+        suffix = os.path.splitext(relative_path)[1]
+        for source_file in self.project.gather_source_files():
+            other = source_file.rel_path
+            if other != relative_path and other.endswith(suffix) and word.search(self.project.read_file(other)):
+                count += 1
+        return count
 
 
 class JetBrainsCodeEditor(CodeEditor[JetBrainsSymbol]):
