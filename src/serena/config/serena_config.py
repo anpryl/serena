@@ -890,7 +890,7 @@ class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
     mapping from language server keys to their priority (higher number = higher priority).
     """
 
-    route_worktree_paths: bool = False
+    route_worktree_paths: bool = True
     """
     whether a tool call whose `relative_path` is an absolute path inside another git worktree of the active project's
     repository runs against a project for that worktree. Applies to the tools interface with the LSP backend only.

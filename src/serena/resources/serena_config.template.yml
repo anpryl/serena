@@ -28,7 +28,7 @@ agent_interface: REPL
 # active project.
 # This applies to the tools interface with the LSP language backend only: with the REPL interface, the setting is
 # ignored (and a log line at startup says so), and with the JetBrains backend, it has no effect.
-route_worktree_paths: False
+route_worktree_paths: True
 
 # line ending convention to use when writing source files.
 # Possible values: "lf" (Unix), "crlf" (Windows), "native" (platform default).
