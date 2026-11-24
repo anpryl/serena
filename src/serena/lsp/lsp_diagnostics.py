@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Self
 
+from serena.util.path_renderer import PathRenderer
 from serena.util.text_utils import TextOutputUtils
 from solidlsp import ls_types
 from solidlsp.lsp_protocol_handler.lsp_types import DiagnosticSeverity
@@ -119,12 +120,13 @@ class GroupedDiagnostics:
             ...
         }
         where:
-        - relative_file_path is the relative path of the file containing the diagnostic
+        - relative_file_path is the path of the file containing the diagnostic, rendered in the style of the current call
         - severity_name is the name of the diagnostic severity (e.g. "Warning", "Error")
         - name_path is the name path of the symbol that owns the diagnostic (or "<file>" if no owner symbol was found)
         - diagnostic_dict is a dictionary containing the diagnostic's message, range, and optionally code and source
         """
-        return self._grouped_diagnostics
+        renderer = PathRenderer.current()
+        return {renderer.render(path): by_severity for path, by_severity in self._grouped_diagnostics.items()}
 
     @staticmethod
     def _diagnostic_severity_name(severity: int | None) -> str:

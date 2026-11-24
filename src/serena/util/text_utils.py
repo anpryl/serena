@@ -14,6 +14,7 @@ from joblib import Parallel, delayed
 from sensai.util.string import ToStringMixin
 
 from serena.util.file_proxy import FileCollection, FileProxy
+from serena.util.path_renderer import PathRenderer
 from solidlsp.ls_utils import TextCoordinateProvider, TextCoordinates, TextUtils
 
 if TYPE_CHECKING:
@@ -696,7 +697,7 @@ class MultiFileContentReplacer:
         new_block = "\n".join(new_lines)
 
         location = f"line {occ.start_line}" if occ.start_line == occ.end_line else f"lines {occ.start_line}-{occ.end_line}"
-        header = f"  [{occ.occurrence_id}] {location}"
+        header = f"  [{PathRenderer.current().render_occurrence_id(occ.occurrence_id)}] {location}"
         if occ.is_ambiguous:
             header += "  (WARNING: the pattern matches again inside this match — possible over-match, verify the diff)"
         diff_lines = [header]
@@ -734,7 +735,8 @@ class MultiFileReplacementResult:
         return sum(self.num_occurrences_by_file.values())
 
     def to_display_string(self) -> str:
-        per_file = "\n".join(f"  {path}: {n}" for path, n in self.num_occurrences_by_file.items())
+        renderer = PathRenderer.current()
+        per_file = "\n".join(f"  {renderer.render(path)}: {n}" for path, n in self.num_occurrences_by_file.items())
         return f"Replaced {self.num_occurrences} occurrence(s) in {len(self.num_occurrences_by_file)} file(s):\n{per_file}"
 
 
@@ -885,6 +887,7 @@ class MultiFileReplacement:
         :param dry_run: whether the listing is the result of a dry run (adding instructions on how to proceed)
         :return: the listing
         """
+        renderer = PathRenderer.current()
         affected_files = self.affected_files
         header = f"Found {len(self.occurrences)} occurrence(s) in {len(affected_files)} file(s)."
         if dry_run:
@@ -896,17 +899,19 @@ class MultiFileReplacement:
         parts = [header]
         for path in affected_files:
             file_occurrences = [o for o in self.occurrences if o.relative_path == path]
-            parts.append(f"\n{path} ({len(file_occurrences)} occurrence(s)):")
+            parts.append(f"\n{renderer.render(path)} ({len(file_occurrences)} occurrence(s)):")
             for occ in file_occurrences:
                 parts.append(self._replacer.render_occurrence_diff(occ, self._contents[path]))
         result = "\n".join(parts)
 
         # shortened result closures, from least to most aggressive shortening
         def make_locations_only() -> str:
-            return "\n".join([header] + [f"  [{o.occurrence_id}] line {o.start_line}" for o in self.occurrences])
+            return "\n".join(
+                [header] + [f"  [{renderer.render_occurrence_id(o.occurrence_id)}] line {o.start_line}" for o in self.occurrences]
+            )
 
         def make_per_file_counts() -> str:
-            counts = {path: sum(1 for o in self.occurrences if o.relative_path == path) for path in affected_files}
+            counts = {renderer.render(path): sum(1 for o in self.occurrences if o.relative_path == path) for path in affected_files}
             return f"{header}\nOccurrence counts per file:\n{TextOutputUtils.to_json(counts)}"
 
         def make_summary() -> str:

@@ -1,0 +1,133 @@
+# serializer version: 1
+# name: TestPathRendering.test_every_tool_renders_paths_in_the_style_of_the_caller[absent]
+  dict({
+    'find_declaration': '{"name_path": "User", "kind": "Class", "relative_path": "test_repo/models.py", "body_location": {"start_line": 31, "end_line": 53}}',
+    'find_referencing_symbols': '{"examples/user_management.py": {"Variable": [{"name_path": "UserManager/get_user/user", "body_location": {"start_line": 57, "end_line": 57}, "content_around_reference": "...  56:        # Try to fetch from service\\n  >  57:        user = self.service.get_user(user_id)\\n...  58:        if user:"}]}, "scripts/run_app.py": {"Variable": [{"name_path": "run_user_operations/found_user", "body_location": {"start_line": 105, "end_line": 105}, "content_around_reference": "... 104:    # Lookup a user\\n  > 105:    found_user = service.get_user(users[0].id)\\n... 106:    if found_user:"}]}}',
+    'find_symbol': '[{"name_path": "User", "kind": "Class", "relative_path": "test_repo/models.py", "body_location": {"start_line": 31, "end_line": 53}, "children": {"Method": [{"name": "__init__", "body_location": {"start_line": 36, "end_line": 39}}, {"name": "to_dict", "body_location": {"start_line": 41, "end_line": 42}}, {"name": "from_dict", "body_location": {"start_line": 44, "end_line": 49}}, {"name": "has_role", "body_location": {"start_line": 51, "end_line": 53}}], "Variable": [{"name": "email", "body_location": {"start_line": 38, "end_line": 38}}, {"name": "roles", "body_location": {"start_line": 39, "end_line": 39}}]}}]',
+    'find_symbol_max_matches': '''
+      Error executing tool find_symbol: ValueError: Matched 5>max_matches=1 symbols.
+      {"test_repo/models.py": ["BaseModel/to_dict", "User/to_dict", "Item/to_dict", "TrackedItem/to_dict"], "custom_test/advanced_features.py": ["Serializable/to_dict"]}
+    ''',
+    'get_diagnostics_for_file': '{"test_repo/diagnostics_sample.py": {"Error": {"broken_factory": [{"message": "\\"missing_user\\" is not defined", "range": {"start": {"line": 4, "character": 11}, "end": {"line": 4, "character": 23}}, "code": "reportUndefinedVariable", "source": "Pyright"}], "broken_consumer": [{"message": "\\"undefined_name\\" is not defined", "range": {"start": {"line": 10, "character": 10}, "end": {"line": 10, "character": 24}}, "code": "reportUndefinedVariable", "source": "Pyright"}]}}}',
+    'get_symbols_overview': '{"Constant": ["T"], "Class": ["BaseModel", "User", "Item", "Collection", "Loggable", "Serializable", "Auditable", "BaseService", "DataService", "NetworkService", "DataSyncService", "LoggableUser", "TrackedItem"], "Function": ["create_user_object"]}',
+    'replace_in_files_applied': '''
+      Replaced 3 occurrence(s) in 1 file(s):
+        test_repo/models.py: 3
+    ''',
+    'replace_in_files_dry_run': '''
+      Found 3 occurrence(s) in 1 file(s). DRY RUN - no changes were applied.
+      Re-issue with dry_run=False to replace all of them, or additionally pass occurrence_ids with the ids of the occurrences to replace.
+      
+      test_repo/models.py (3 occurrence(s)):
+        [test_repo/models.py:0@8597e4855ff491fb] line 95
+          - class Loggable:
+          + class Traceable:
+        [test_repo/models.py:1@e117961dba9dbdbc] line 209
+          - class LoggableUser(User, Loggable):
+          + class TraceableUser(User, Loggable):
+        [test_repo/models.py:2@e7e514756dd2f641] line 209
+          - class LoggableUser(User, Loggable):
+          + class LoggableUser(User, Traceable):
+    ''',
+    'safe_delete_symbol': 'Cannot delete, the symbol User is referenced in: {"examples/user_management.py": [13, 40, 43, 51, 76, 81, 90], "scripts/run_app.py": [18, 56], "test_repo/diagnostics_sample.py": [0, 3], "test_repo/models.py": [45, 87, 89, 209], "test_repo/services.py": [6, 12, 15, 20, 24, 28]}',
+  })
+# ---
+# name: TestPathRendering.test_every_tool_renders_paths_in_the_style_of_the_caller[inside]
+  dict({
+    'find_declaration': '{"name_path": "User", "kind": "Class", "relative_path": "test_repo/models.py", "body_location": {"start_line": 31, "end_line": 53}}',
+    'find_referencing_symbols': '{"examples/user_management.py": {"Variable": [{"name_path": "UserManager/get_user/user", "body_location": {"start_line": 57, "end_line": 57}, "content_around_reference": "...  56:        # Try to fetch from service\\n  >  57:        user = self.service.get_user(user_id)\\n...  58:        if user:"}]}, "scripts/run_app.py": {"Variable": [{"name_path": "run_user_operations/found_user", "body_location": {"start_line": 105, "end_line": 105}, "content_around_reference": "... 104:    # Lookup a user\\n  > 105:    found_user = service.get_user(users[0].id)\\n... 106:    if found_user:"}]}}',
+    'find_symbol': '[{"name_path": "User", "kind": "Class", "relative_path": "test_repo/models.py", "body_location": {"start_line": 31, "end_line": 53}, "children": {"Method": [{"name": "__init__", "body_location": {"start_line": 36, "end_line": 39}}, {"name": "to_dict", "body_location": {"start_line": 41, "end_line": 42}}, {"name": "from_dict", "body_location": {"start_line": 44, "end_line": 49}}, {"name": "has_role", "body_location": {"start_line": 51, "end_line": 53}}], "Variable": [{"name": "email", "body_location": {"start_line": 38, "end_line": 38}}, {"name": "roles", "body_location": {"start_line": 39, "end_line": 39}}]}}]',
+    'find_symbol_max_matches': '''
+      Error executing tool find_symbol: ValueError: Matched 5>max_matches=1 symbols.
+      {"test_repo/models.py": ["BaseModel/to_dict", "User/to_dict", "Item/to_dict", "TrackedItem/to_dict"], "custom_test/advanced_features.py": ["Serializable/to_dict"]}
+    ''',
+    'get_diagnostics_for_file': '{"test_repo/diagnostics_sample.py": {"Error": {"broken_factory": [{"message": "\\"missing_user\\" is not defined", "range": {"start": {"line": 4, "character": 11}, "end": {"line": 4, "character": 23}}, "code": "reportUndefinedVariable", "source": "Pyright"}], "broken_consumer": [{"message": "\\"undefined_name\\" is not defined", "range": {"start": {"line": 10, "character": 10}, "end": {"line": 10, "character": 24}}, "code": "reportUndefinedVariable", "source": "Pyright"}]}}}',
+    'get_symbols_overview': '{"Constant": ["T"], "Class": ["BaseModel", "User", "Item", "Collection", "Loggable", "Serializable", "Auditable", "BaseService", "DataService", "NetworkService", "DataSyncService", "LoggableUser", "TrackedItem"], "Function": ["create_user_object"]}',
+    'replace_in_files_applied': '''
+      Replaced 3 occurrence(s) in 1 file(s):
+        test_repo/models.py: 3
+    ''',
+    'replace_in_files_dry_run': '''
+      Found 3 occurrence(s) in 1 file(s). DRY RUN - no changes were applied.
+      Re-issue with dry_run=False to replace all of them, or additionally pass occurrence_ids with the ids of the occurrences to replace.
+      
+      test_repo/models.py (3 occurrence(s)):
+        [test_repo/models.py:0@8597e4855ff491fb] line 95
+          - class Loggable:
+          + class Traceable:
+        [test_repo/models.py:1@e117961dba9dbdbc] line 209
+          - class LoggableUser(User, Loggable):
+          + class TraceableUser(User, Loggable):
+        [test_repo/models.py:2@e7e514756dd2f641] line 209
+          - class LoggableUser(User, Loggable):
+          + class LoggableUser(User, Traceable):
+    ''',
+    'safe_delete_symbol': 'Cannot delete, the symbol User is referenced in: {"examples/user_management.py": [13, 40, 43, 51, 76, 81, 90], "scripts/run_app.py": [18, 56], "test_repo/diagnostics_sample.py": [0, 3], "test_repo/models.py": [45, 87, 89, 209], "test_repo/services.py": [6, 12, 15, 20, 24, 28]}',
+  })
+# ---
+# name: TestPathRendering.test_every_tool_renders_paths_in_the_style_of_the_caller[inside_subfolder]
+  dict({
+    'find_declaration': '{"name_path": "User", "kind": "Class", "relative_path": "test_repo/models.py", "body_location": {"start_line": 31, "end_line": 53}}',
+    'find_referencing_symbols': '{"examples/user_management.py": {"Variable": [{"name_path": "UserManager/get_user/user", "body_location": {"start_line": 57, "end_line": 57}, "content_around_reference": "...  56:        # Try to fetch from service\\n  >  57:        user = self.service.get_user(user_id)\\n...  58:        if user:"}]}, "scripts/run_app.py": {"Variable": [{"name_path": "run_user_operations/found_user", "body_location": {"start_line": 105, "end_line": 105}, "content_around_reference": "... 104:    # Lookup a user\\n  > 105:    found_user = service.get_user(users[0].id)\\n... 106:    if found_user:"}]}}',
+    'find_symbol': '[{"name_path": "User", "kind": "Class", "relative_path": "test_repo/models.py", "body_location": {"start_line": 31, "end_line": 53}, "children": {"Method": [{"name": "__init__", "body_location": {"start_line": 36, "end_line": 39}}, {"name": "to_dict", "body_location": {"start_line": 41, "end_line": 42}}, {"name": "from_dict", "body_location": {"start_line": 44, "end_line": 49}}, {"name": "has_role", "body_location": {"start_line": 51, "end_line": 53}}], "Variable": [{"name": "email", "body_location": {"start_line": 38, "end_line": 38}}, {"name": "roles", "body_location": {"start_line": 39, "end_line": 39}}]}}]',
+    'find_symbol_max_matches': '''
+      Error executing tool find_symbol: ValueError: Matched 5>max_matches=1 symbols.
+      {"test_repo/models.py": ["BaseModel/to_dict", "User/to_dict", "Item/to_dict", "TrackedItem/to_dict"], "custom_test/advanced_features.py": ["Serializable/to_dict"]}
+    ''',
+    'get_diagnostics_for_file': '{"test_repo/diagnostics_sample.py": {"Error": {"broken_factory": [{"message": "\\"missing_user\\" is not defined", "range": {"start": {"line": 4, "character": 11}, "end": {"line": 4, "character": 23}}, "code": "reportUndefinedVariable", "source": "Pyright"}], "broken_consumer": [{"message": "\\"undefined_name\\" is not defined", "range": {"start": {"line": 10, "character": 10}, "end": {"line": 10, "character": 24}}, "code": "reportUndefinedVariable", "source": "Pyright"}]}}}',
+    'get_symbols_overview': '{"Constant": ["T"], "Class": ["BaseModel", "User", "Item", "Collection", "Loggable", "Serializable", "Auditable", "BaseService", "DataService", "NetworkService", "DataSyncService", "LoggableUser", "TrackedItem"], "Function": ["create_user_object"]}',
+    'replace_in_files_applied': '''
+      Replaced 3 occurrence(s) in 1 file(s):
+        test_repo/models.py: 3
+    ''',
+    'replace_in_files_dry_run': '''
+      Found 3 occurrence(s) in 1 file(s). DRY RUN - no changes were applied.
+      Re-issue with dry_run=False to replace all of them, or additionally pass occurrence_ids with the ids of the occurrences to replace.
+      
+      test_repo/models.py (3 occurrence(s)):
+        [test_repo/models.py:0@8597e4855ff491fb] line 95
+          - class Loggable:
+          + class Traceable:
+        [test_repo/models.py:1@e117961dba9dbdbc] line 209
+          - class LoggableUser(User, Loggable):
+          + class TraceableUser(User, Loggable):
+        [test_repo/models.py:2@e7e514756dd2f641] line 209
+          - class LoggableUser(User, Loggable):
+          + class LoggableUser(User, Traceable):
+    ''',
+    'safe_delete_symbol': 'Cannot delete, the symbol User is referenced in: {"examples/user_management.py": [13, 40, 43, 51, 76, 81, 90], "scripts/run_app.py": [18, 56], "test_repo/diagnostics_sample.py": [0, 3], "test_repo/models.py": [45, 87, 89, 209], "test_repo/services.py": [6, 12, 15, 20, 24, 28]}',
+  })
+# ---
+# name: TestPathRendering.test_every_tool_renders_paths_in_the_style_of_the_caller[outside]
+  dict({
+    'find_declaration': '{"name_path": "User", "kind": "Class", "relative_path": "<ROOT>/test_repo/models.py", "body_location": {"start_line": 31, "end_line": 53}}',
+    'find_referencing_symbols': '{"<ROOT>/examples/user_management.py": {"Variable": [{"name_path": "UserManager/get_user/user", "body_location": {"start_line": 57, "end_line": 57}, "content_around_reference": "...  56:        # Try to fetch from service\\n  >  57:        user = self.service.get_user(user_id)\\n...  58:        if user:"}]}, "<ROOT>/scripts/run_app.py": {"Variable": [{"name_path": "run_user_operations/found_user", "body_location": {"start_line": 105, "end_line": 105}, "content_around_reference": "... 104:    # Lookup a user\\n  > 105:    found_user = service.get_user(users[0].id)\\n... 106:    if found_user:"}]}}',
+    'find_symbol': '[{"name_path": "User", "kind": "Class", "relative_path": "<ROOT>/test_repo/models.py", "body_location": {"start_line": 31, "end_line": 53}, "children": {"Method": [{"name": "__init__", "body_location": {"start_line": 36, "end_line": 39}}, {"name": "to_dict", "body_location": {"start_line": 41, "end_line": 42}}, {"name": "from_dict", "body_location": {"start_line": 44, "end_line": 49}}, {"name": "has_role", "body_location": {"start_line": 51, "end_line": 53}}], "Variable": [{"name": "email", "body_location": {"start_line": 38, "end_line": 38}}, {"name": "roles", "body_location": {"start_line": 39, "end_line": 39}}]}}]',
+    'find_symbol_max_matches': '''
+      Error executing tool find_symbol: ValueError: Matched 5>max_matches=1 symbols.
+      {"<ROOT>/test_repo/models.py": ["BaseModel/to_dict", "User/to_dict", "Item/to_dict", "TrackedItem/to_dict"], "<ROOT>/custom_test/advanced_features.py": ["Serializable/to_dict"]}
+    ''',
+    'get_diagnostics_for_file': '{"<ROOT>/test_repo/diagnostics_sample.py": {"Error": {"broken_factory": [{"message": "\\"missing_user\\" is not defined", "range": {"start": {"line": 4, "character": 11}, "end": {"line": 4, "character": 23}}, "code": "reportUndefinedVariable", "source": "Pyright"}], "broken_consumer": [{"message": "\\"undefined_name\\" is not defined", "range": {"start": {"line": 10, "character": 10}, "end": {"line": 10, "character": 24}}, "code": "reportUndefinedVariable", "source": "Pyright"}]}}}',
+    'get_symbols_overview': '{"Constant": ["T"], "Class": ["BaseModel", "User", "Item", "Collection", "Loggable", "Serializable", "Auditable", "BaseService", "DataService", "NetworkService", "DataSyncService", "LoggableUser", "TrackedItem"], "Function": ["create_user_object"]}',
+    'replace_in_files_applied': '''
+      Replaced 3 occurrence(s) in 1 file(s):
+        <ROOT>/test_repo/models.py: 3
+    ''',
+    'replace_in_files_dry_run': '''
+      Found 3 occurrence(s) in 1 file(s). DRY RUN - no changes were applied.
+      Re-issue with dry_run=False to replace all of them, or additionally pass occurrence_ids with the ids of the occurrences to replace.
+      
+      <ROOT>/test_repo/models.py (3 occurrence(s)):
+        [<ROOT>/test_repo/models.py:0@8597e4855ff491fb] line 95
+          - class Loggable:
+          + class Traceable:
+        [<ROOT>/test_repo/models.py:1@e117961dba9dbdbc] line 209
+          - class LoggableUser(User, Loggable):
+          + class TraceableUser(User, Loggable):
+        [<ROOT>/test_repo/models.py:2@e7e514756dd2f641] line 209
+          - class LoggableUser(User, Loggable):
+          + class LoggableUser(User, Traceable):
+    ''',
+    'safe_delete_symbol': 'Cannot delete, the symbol User is referenced in: {"<ROOT>/examples/user_management.py": [13, 40, 43, 51, 76, 81, 90], "<ROOT>/scripts/run_app.py": [18, 56], "<ROOT>/test_repo/diagnostics_sample.py": [0, 3], "<ROOT>/test_repo/models.py": [45, 87, 89, 209], "<ROOT>/test_repo/services.py": [6, 12, 15, 20, 24, 28]}',
+  })
+# ---

@@ -30,6 +30,7 @@ from serena.tools import (
     RestartLanguageServerTool,
     SafeDeleteSymbol,
 )
+from serena.util.path_renderer import PathRenderer
 from serena.util.text_utils import TextOutputUtils, find_text_coordinates
 from solidlsp.lsp_protocol_handler.lsp_types import SymbolKind
 
@@ -68,7 +69,7 @@ class LspSymbolCollection(RepresentableViaRenderer):
     def relative_path_to_name_paths_(self) -> dict[str, list[str]]:
         result: defaultdict[str, list[str]] = defaultdict(list)
         for s in self.symbols:
-            result[s.location.relative_path or "unknown"].append(s.get_name_path())
+            result[PathRenderer.current().render(s.location.relative_path) or "unknown"].append(s.get_name_path())
         return result
 
 
@@ -797,7 +798,7 @@ class LspApi(FacadeApi):
             ref_relative_path = ref_loc.get("relativePath")
             if ref_relative_path is None:
                 continue
-            file_to_lines[ref_relative_path].append(ref_loc["range"]["start"]["line"])
+            file_to_lines[PathRenderer.current().render(ref_relative_path)].append(ref_loc["range"]["start"]["line"])
         if file_to_lines:
             return f"Cannot delete, the symbol {symbol_name_path} is referenced in: {TextOutputUtils.to_json(file_to_lines)}"
 

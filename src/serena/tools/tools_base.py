@@ -22,6 +22,7 @@ from serena.prompt_factory import PromptFactory
 from serena.repl.facade import SUCCESS_RESULT
 from serena.util.class_decorators import singleton
 from serena.util.inspection import iter_subclasses
+from serena.util.path_renderer import PathRenderer
 from serena.util.text_utils import TextOutputUtils
 from solidlsp.ls_exceptions import SolidLSPException
 
@@ -320,7 +321,7 @@ class Tool(Component):
             except Exception as e:
                 log.info(f"Failed to get client info: {e}.")
 
-        def task() -> str:
+        def scoped_task() -> str:
             apply_fn = self.get_apply_fn()
 
             try:
@@ -341,7 +342,7 @@ class Tool(Component):
                         )
 
                 # construct apply kwargs, adding session_id if the tool is session-aware
-                apply_kwargs = dict(kwargs)
+                apply_kwargs = PathRenderer.current().parse_arguments(kwargs)
 
                 # apply the actual tool
                 try:
@@ -384,6 +385,12 @@ class Tool(Component):
                 log.error(f"Error saving language server cache: {e}")
 
             return result
+
+        def task() -> str:
+            project = self.agent.get_active_project()
+            renderer = PathRenderer.for_call(project.project_root if project is not None else None, mcp_ctx)
+            with renderer.active():
+                return scoped_task()
 
         # execute the tool in the agent's task executor, with timeout
         # (task timeout bounds task execution in the dispatcher once it runs, result timeout limits the time we wait)

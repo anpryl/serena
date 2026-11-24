@@ -23,6 +23,7 @@ from solidlsp.ls_utils import TextUtils
 
 from .ls_manager import LanguageServerManager
 from .project import Project
+from .util.path_renderer import PathRenderer
 
 log = logging.getLogger(__name__)
 NAME_PATH_SEP = "/"
@@ -57,6 +58,8 @@ class LanguageServerSymbolLocation:
         result = asdict(self)
         if not include_relative_path:
             result.pop("relative_path", None)
+        else:
+            result["relative_path"] = PathRenderer.current().render(self.relative_path)
         return result
 
     def has_position_in_file(self) -> bool:
@@ -506,7 +509,7 @@ class LanguageServerSymbol(Symbol, ToStringMixin):
         if location:
             result["location"] = self.location.to_dict(include_relative_path=relative_path)
         elif relative_path:
-            result["relative_path"] = self.relative_path
+            result["relative_path"] = PathRenderer.current().render(self.relative_path)
 
         if body_location:
             body_start_line, body_end_line = self.get_body_line_numbers()
