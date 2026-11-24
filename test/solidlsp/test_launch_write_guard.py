@@ -14,7 +14,7 @@ import pytest
 from solidlsp.language_servers.clangd_language_server import ClangdLanguageServer
 from solidlsp.language_servers.pyrefly_server import PyreflyLanguageServer
 from solidlsp.language_servers.scala_language_server import ScalaLanguageServer
-from solidlsp.ls_config import LanguageServerId
+from solidlsp.ls_config import LanguageServerConfig, LanguageServerId
 from solidlsp.settings import SolidLSPSettings, WriteGuard, WriteRefusal
 from solidlsp.util.metals_db_utils import MetalsDbStatus, MetalsLockInfo
 
@@ -48,6 +48,7 @@ def _settings(tmp_path: Path, guard: WriteGuard, project_data_path: Path, ls_spe
 def _make_clangd(root: Path, settings: SolidLSPSettings, custom_settings: dict) -> ClangdLanguageServer:
     server = object.__new__(ClangdLanguageServer)
     server.repository_root_path = str(root)
+    server.config = LanguageServerConfig(ls_id=LanguageServerId.CPP)
     server._solidlsp_settings = settings
     server._custom_settings = custom_settings
     return server
