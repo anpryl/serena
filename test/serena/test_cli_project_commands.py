@@ -10,8 +10,9 @@ import pytest
 from click import Command, Option
 from click.testing import CliRunner
 
-from serena.cli import ProjectCommands, TopLevelCommands, find_project_root
+from serena.cli import ProjectCommands, TopLevelCommands
 from serena.config.serena_config import ProjectConfig
+from serena.util.project_root import find_project_root
 
 pytestmark = pytest.mark.filterwarnings("ignore::UserWarning")
 
