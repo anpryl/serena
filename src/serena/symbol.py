@@ -18,6 +18,7 @@ import serena.jetbrains.jetbrains_types as jb
 from solidlsp import SolidLanguageServer, ls_types
 from solidlsp.ls import LSPFileBuffer
 from solidlsp.ls import ReferenceInSymbol as LSPReferenceInSymbol
+from solidlsp.ls_exceptions import IgnoredPathError
 from solidlsp.ls_types import Position, SymbolKind, UnifiedSymbolInformation
 from solidlsp.ls_utils import TextUtils
 
@@ -748,6 +749,17 @@ class LanguageServerSymbolRetriever:
         """:param relative_path: relative path to a file"""
         return self._ls_manager.get_language_server(relative_path)
 
+    @contextmanager
+    def _ignored_path_named_by_output_path(self) -> Iterator[None]:
+        """
+        Context manager for a language server request, re-raising a request's error about an ignored path with the path
+        named by the project's output paths (see `Project.output_paths`).
+        """
+        try:
+            yield
+        except IgnoredPathError as e:
+            raise ValueError(e.get_message(self.project.output_paths.of(e.relative_path))) from e
+
     def find(
         self,
         name_path_pattern: str,
@@ -771,7 +783,8 @@ class LanguageServerSymbolRetriever:
         else:
             lang_servers = self._ls_manager.iter_language_servers()
         for lang_server in lang_servers:
-            symbol_roots = lang_server.request_full_symbol_tree(within_relative_path=within_relative_path)
+            with self._ignored_path_named_by_output_path():
+                symbol_roots = lang_server.request_full_symbol_tree(within_relative_path=within_relative_path)
             for root in symbol_roots:
                 symbols.extend(
                     LanguageServerSymbol(root).find(
@@ -1165,7 +1178,8 @@ class LanguageServerSymbolRetriever:
             For the case where a file is passed, the mapping will contain a single entry.
         """
         lang_server = self.get_language_server(relative_path)
-        path_to_unified_symbols = lang_server.request_overview(relative_path)
+        with self._ignored_path_named_by_output_path():
+            path_to_unified_symbols = lang_server.request_overview(relative_path)
         return {k: [LanguageServerSymbol(us) for us in v] for k, v in path_to_unified_symbols.items()}
 
 

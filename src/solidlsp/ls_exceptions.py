@@ -82,3 +82,25 @@ class MetalsStaleLockError(SolidLSPException):
                 "on_stale_lock='auto-clean' in ls_specific_settings.scala."
             )
         super().__init__(message)
+
+
+class IgnoredPathError(ValueError):
+    """
+    Raised when a path explicitly passed to a request is ignored.
+    """
+
+    def __init__(self, relative_path: str, message_format: str) -> None:
+        """
+        :param relative_path: the ignored path, relative to the repository root
+        :param message_format: the error message, with the placeholder `{path}` where the path is given
+        """
+        self.relative_path = relative_path
+        self._message_format = message_format
+        super().__init__(self.get_message(relative_path))
+
+    def get_message(self, path_name: str) -> str:
+        """
+        :param path_name: the name by which to give the ignored path
+        :return: the error message, giving the path by that name
+        """
+        return self._message_format.format(path=path_name)

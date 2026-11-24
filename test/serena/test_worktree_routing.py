@@ -338,7 +338,7 @@ def paths_under(result: str, root: Path) -> list[str]:
     """
     :return: the paths under the given root that a tool result names, in order of appearance
     """
-    return [path.removesuffix(".") for path in re.findall(re.escape(str(root)) + r"[^\"\s:,\]\}\)]*", result)]
+    return [path.removesuffix(".") for path in re.findall(re.escape(str(root)) + r"[^\"'\s:,\]\}\)]*", result)]
 
 
 def snapshot_files(root: Path) -> dict[str, bytes]:
@@ -1090,6 +1090,7 @@ class TestWorktreeRouting:
             "matched_lines_truncated",
             "match_line_numbers",
             "match_counts_per_file",
+            "ignored_path_error",
         ],
     )
     def test_path_from_routed_result_routes_back(
@@ -1170,6 +1171,11 @@ class TestWorktreeRouting:
                     ),
                     header,
                 )
+            case "ignored_path_error":
+                result = call(
+                    agent, FindSymbolTool, name_path_pattern="VariableContainer", relative_path=str(root / MAIN_ONLY_IGNORED_FILE)
+                )
+                assert "is ignored" in result, result
             case _:
                 result = call(agent, CreateTextFileTool, relative_path=str(root / "created.py"), content="x = 1\n")
         python_paths = [p for p in paths_under(result, root) if p.endswith(".py")]
