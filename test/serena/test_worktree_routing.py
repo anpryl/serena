@@ -18,7 +18,7 @@ import pytest
 
 from serena import code_editor as code_editor_module
 from serena.agent import SerenaAgent
-from serena.config.serena_config import ProjectConfig, RegisteredProject, SerenaConfig
+from serena.config.serena_config import AgentInterface, ProjectConfig, RegisteredProject, SerenaConfig
 from serena.constants import PROJECT_TEMPLATE_FILE
 from serena.language_backend import BuiltinLanguageBackend
 from serena.lsp.lsp_diagnostics import DiagnosticsContext
@@ -26,6 +26,7 @@ from serena.project import Project
 from serena.tools import (
     CreateTextFileTool,
     DeleteLinesTool,
+    EditMemoryTool,
     FindDeclarationTool,
     FindFileTool,
     FindReferencingSymbolsTool,
@@ -36,7 +37,9 @@ from serena.tools import (
     InsertAtLineTool,
     InsertBeforeSymbolTool,
     ListDirTool,
+    ListMemoriesTool,
     ReadFileTool,
+    ReadMemoryTool,
     RenameSymbolTool,
     ReplaceContentTool,
     ReplaceInFilesTool,
@@ -44,7 +47,9 @@ from serena.tools import (
     ReplaceSymbolBodyTool,
     SafeDeleteSymbol,
     SearchForPatternTool,
+    SerenaReplTool,
     Tool,
+    WriteMemoryTool,
 )
 from serena.tools.tools_base import EditingToolWithDiagnostics
 from serena.worktree_routing import WorktreeRouter
@@ -478,6 +483,85 @@ class TestWorktreeRouting:
                 tool_class, kwargs = GetSymbolsOverviewTool, {"relative_path": str(outside_file)}
 
         assert call(agent, tool_class, **kwargs) == call_unrouted(agent, tool_class, **kwargs)
+
+    def test_sibling_worktree_paths_are_refused_with_routing_off(self, agent: SerenaAgent, worktree_repo: WorktreeRepo) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        path = str(sibling.root / MODELS_FILE)
+        main_before = snapshot_files(worktree_repo.main)
+        sibling_before = snapshot_files(sibling.root)
+
+        for tool_class, kwargs in [
+            (GetSymbolsOverviewTool, {"relative_path": path}),
+            (FindSymbolTool, {"name_path_pattern": sibling.marker, "relative_path": str(sibling.root)}),
+            (ReplaceContentTool, {"relative_path": path, "needle": sibling.marker, "repl": "edited", "mode": "literal"}),
+            (ReplaceSymbolBodyTool, {"name_path": sibling.marker, "relative_path": path, "body": "def edited() -> None:\n    pass"}),
+            (CreateTextFileTool, {"relative_path": str(sibling.root / "created.py"), "content": "created = 1\n"}),
+        ]:
+            result = call_unrouted(agent, tool_class, **kwargs)
+            assert "points outside the project root" in result, (tool_class, result)
+
+        assert snapshot_files(sibling.root) == sibling_before
+        assert snapshot_files(worktree_repo.main) == main_before
+
+    def test_nested_worktree_symbols_stay_ignored_with_routing_off(self, agent: SerenaAgent, worktree_repo: WorktreeRepo) -> None:
+        # with routing off, the nested worktree is just an ignored directory of the main project, as without this feature
+        nested = worktree_repo.worktrees["nested"]
+        path = str(nested.root / MODELS_FILE)
+        nested_before = snapshot_files(nested.root)
+
+        for tool_class, kwargs in [
+            (GetSymbolsOverviewTool, {"relative_path": path}),
+            (FindSymbolTool, {"name_path_pattern": nested.marker, "relative_path": str(nested.root)}),
+            (ReplaceSymbolBodyTool, {"name_path": nested.marker, "relative_path": path, "body": "def edited() -> None:\n    pass"}),
+        ]:
+            result = call_unrouted(agent, tool_class, **kwargs)
+            assert nested.marker not in result, (tool_class, result)
+            assert "Error" in result, (tool_class, result)
+
+        assert snapshot_files(nested.root) == nested_before
+
+    def test_repl_interface_does_not_route(self, worktree_repo: WorktreeRepo, caplog: pytest.LogCaptureFixture) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        path = str(sibling.root / MODELS_FILE)
+        main_before = snapshot_files(worktree_repo.main)
+        sibling_before = snapshot_files(sibling.root)
+
+        with caplog.at_level(logging.INFO, logger="serena.agent"):
+            with routing_agent(worktree_repo.main, agent_interface=AgentInterface.REPL) as agent:
+                assert "Ignoring route_worktree_paths" in caplog.text
+
+                session_id = "worktree_routing_session"
+                repl = agent.get_tool(SerenaReplTool)
+                overview = repl.apply_ex(session=session_id, code=f"s.lsp.get_symbols_overview({path!r})")
+                assert "points outside the project root" in overview, overview
+                assert sibling.marker not in overview
+                edit = f"s.edit.replace_content({path!r}, needle={sibling.marker!r}, repl='edited', mode='literal')"
+                edited = repl.apply_ex(session=session_id, code=edit)
+                assert "points outside the project root" in edited, edited
+
+        assert snapshot_files(sibling.root) == sibling_before
+        assert snapshot_files(worktree_repo.main) == main_before
+
+    def test_memories_stay_in_main_project_across_routed_calls(self, agent: SerenaAgent, worktree_repo: WorktreeRepo) -> None:
+        memories_dir = worktree_repo.main / ".serena" / "memories"
+
+        def route_to_each_worktree() -> None:
+            for worktree in worktree_repo.worktrees.values():
+                path = str(worktree.root / MODELS_FILE)
+                assert worktree.marker in call(agent, GetSymbolsOverviewTool, relative_path=path)
+                call(agent, ReplaceContentTool, relative_path=path, needle=r"\Z", repl="\n# routed\n", mode="regex")
+
+        route_to_each_worktree()
+        call(agent, WriteMemoryTool, memory_name="routing_note", content="written after routed calls")
+        route_to_each_worktree()
+        call(agent, EditMemoryTool, memory_name="routing_note", needle="written", repl="edited", mode="literal")
+        route_to_each_worktree()
+
+        assert (memories_dir / "routing_note.md").read_text(encoding="utf-8") == "edited after routed calls"
+        assert "edited after routed calls" in call(agent, ReadMemoryTool, memory_name="routing_note")
+        assert "routing_note" in call(agent, ListMemoriesTool)
+        for worktree in worktree_repo.worktrees.values():
+            assert not (worktree.root / ".serena" / "memories" / "routing_note.md").exists()
 
     def test_timed_out_routed_call_does_not_affect_next_call(
         self, agent: SerenaAgent, worktree_repo: WorktreeRepo, monkeypatch: pytest.MonkeyPatch

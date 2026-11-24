@@ -21,6 +21,15 @@ language_backend: LSP
 # Further information: https://oraios.github.io/serena/02-usage/050_configuration.html#agent-interfaces
 agent_interface: REPL
 
+# whether a tool call whose `relative_path` is an absolute path inside another git worktree of the active project's
+# repository runs against a project for that worktree rather than against the active project (which refuses a path
+# outside its root, and treats a worktree nested inside its root as one of its own directories).
+# Reads and edits then land in that worktree, and results name its files by absolute path; memories stay with the
+# active project.
+# This applies to the tools interface with the LSP language backend only: with the REPL interface, the setting is
+# ignored (and a log line at startup says so), and with the JetBrains backend, it has no effect.
+route_worktree_paths: False
+
 # line ending convention to use when writing source files.
 # Possible values: "lf" (Unix), "crlf" (Windows), "native" (platform default).
 # Note that Serena's own files (e.g. memories and configuration files) always use native line endings.

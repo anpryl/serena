@@ -724,6 +724,10 @@ class SerenaAgent:
             log_choice=True,
         )
 
+        # report the worktree routing setting as ignored, since the paths of the REPL's executed code never reach a tool's arguments
+        if self.serena_config.route_worktree_paths and self._agent_interface.is_repl():
+            log.info("Ignoring route_worktree_paths: worktree routing applies to the tools interface only, not to the REPL interface")
+
         # create executor for starting the language server and running tools in another thread
         # This executor is used to achieve linear task execution
         self._task_executor = TaskExecutor("SerenaAgentTaskExecutor", self._task_completion_callback)
