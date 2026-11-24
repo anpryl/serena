@@ -30,6 +30,7 @@ import pathlib
 import shutil
 import stat
 import threading
+import uuid
 from dataclasses import dataclass
 
 from filelock import FileLock, Timeout
@@ -43,7 +44,7 @@ from solidlsp.ls import (
 )
 from solidlsp.ls_config import LanguageServerConfig
 from solidlsp.ls_utils import FileUtils, PlatformId, PlatformUtils
-from solidlsp.settings import SolidLSPSettings
+from solidlsp.settings import SolidLSPSettings, WriteGuard, WriteRefusal
 
 log = logging.getLogger(__name__)
 
@@ -125,11 +126,24 @@ class KotlinLanguageServer(SolidLanguageServer):
         self._progress_lock = threading.Lock()
 
     def _create_dependency_provider(self) -> LanguageServerDependencyProvider:
-        return self.DependencyProvider(self._custom_settings, self._ls_resources_dir, str(self.cache_dir))
+        return self.DependencyProvider(
+            self._custom_settings, self._ls_resources_dir, str(self.cache_dir), write_guard=self._solidlsp_settings.write_guard
+        )
 
     class DependencyProvider(LanguageServerDependencyProviderSinglePath):
-        def __init__(self, custom_settings: SolidLSPSettings.CustomLSSettings, ls_resources_dir: str, project_cache_dir: str):
+        def __init__(
+            self,
+            custom_settings: SolidLSPSettings.CustomLSSettings,
+            ls_resources_dir: str,
+            project_cache_dir: str,
+            write_guard: WriteGuard | None = None,
+        ):
+            """
+            :param write_guard: the checks to apply before writing to the project data folder (in which the project
+                cache directory lies), if any
+            """
             super().__init__(custom_settings, ls_resources_dir)
+            self._write_guard = write_guard
             self._storage_lock: FileLock | None = None
             self._is_fallback_storage_dir = False
             self.storage_dir = self._claim_storage_dir(project_cache_dir)
@@ -140,34 +154,69 @@ class KotlinLanguageServer(SolidLanguageServer):
 
             Tries the shared, deterministic per-project directory first via a non-blocking file lock, so a
             single Serena instance keeps reusing its index across restarts (the primary use case, which must
-            not regress). If another live Serena instance already holds that directory (concurrent sessions
-            on the same project, see oraios/serena#1966), falls back to a directory unique to this process
-            instead of two Kotlin LSP processes contending for the same index. That fallback directory is
-            this instance's alone, so it is removed once the instance releases it (see release_storage_lock).
+            not regress). If another live Kotlin language server already holds that directory (one of another
+            Serena instance, as with concurrent sessions on the same project, see oraios/serena#1966, or an
+            older one of this process still running beside its replacement), falls back to a directory unique
+            to this instance instead of two Kotlin LSP processes contending for the same index. That fallback
+            directory is this instance's alone, so it is removed once the instance releases it (see
+            release_storage_lock), unless the write guard refuses the removal, in which case it is left in
+            place.
             """
-            lock = FileLock(f"{project_cache_dir}.lock")
+            lock_path = f"{project_cache_dir}.lock"
+            self._check_data_write(lock_path)
+            lock = FileLock(lock_path)
             try:
                 lock.acquire(timeout=0)
             except Timeout:
-                instance_dir = f"{project_cache_dir}-instance-{os.getpid()}"
-                os.makedirs(instance_dir, exist_ok=True)
+                instance_dir = f"{project_cache_dir}-instance-{os.getpid()}-{uuid.uuid4().hex}"
+                self._check_data_write(instance_dir)
+                os.makedirs(instance_dir)
                 self._is_fallback_storage_dir = True
                 log.info(
-                    "Kotlin LSP storage directory %s is in use by another Serena instance; using %s for this instance",
+                    "Kotlin LSP storage directory %s is in use by another live Kotlin language server (of another Serena "
+                    "instance or of this process); using %s for this instance",
                     project_cache_dir,
                     instance_dir,
                 )
                 return instance_dir
+            # the directory is handed to the Kotlin LSP process, which writes its index there, whether or not it exists
+            try:
+                self._check_data_write(project_cache_dir)
+            except WriteRefusal:
+                lock.release()
+                raise
             self._storage_lock = lock
             return project_cache_dir
 
         def release_storage_lock(self) -> None:
             if self._is_fallback_storage_dir:
-                shutil.rmtree(self.storage_dir, ignore_errors=True)
+                try:
+                    if self._write_guard is not None:
+                        self._write_guard.check_data_entry_write(self.storage_dir)
+                    shutil.rmtree(self.storage_dir, ignore_errors=True)
+                except WriteRefusal as e:
+                    log.warning("Not removing the Kotlin LSP storage directory %s: %s", self.storage_dir, e)
                 self._is_fallback_storage_dir = False
             if self._storage_lock is not None:
                 self._storage_lock.release()
                 self._storage_lock = None
+
+        def _get_checked_system_dir(self) -> str:
+            """
+            :return: the system directory, which is handed to the Kotlin LSP process as a place to write, after checking
+                it (whether or not it exists) with the write guard
+            :raises WriteRefusal: if the write guard refuses writes to the directory
+            """
+            self._check_data_write(self._system_dir)
+            return self._system_dir
+
+        def _check_data_write(self, path: str) -> None:
+            """
+            :param path: the absolute path of a write to the project data folder, about to happen
+            :raises WriteRefusal: if the write guard refuses the write
+            """
+            if self._write_guard is not None:
+                self._write_guard.check_data_write(path)
 
         @classmethod
         def _create_artifact(cls, version: str, platform_id: PlatformId) -> KotlinLSPArtifact:
@@ -275,7 +324,7 @@ class KotlinLanguageServer(SolidLanguageServer):
             platform_id = PlatformUtils.get_platform_id()
             intellij_launcher_name = "intellij-server.exe" if platform_id.is_windows() else "intellij-server"
             if os.path.basename(core_path).lower() == intellij_launcher_name:
-                command.extend(["--system-path", self._system_dir])
+                command.extend(["--system-path", self._get_checked_system_dir()])
             return command
 
         def create_launch_command_env(self) -> dict[str, str]:
@@ -292,8 +341,9 @@ class KotlinLanguageServer(SolidLanguageServer):
                 jvm_options = DEFAULT_KOTLIN_JVM_OPTIONS
 
             # preserve the claimed system directory as one JVM option, including paths containing spaces
-            os.makedirs(self._system_dir, exist_ok=True)
-            idea_system_path_opt = f'-Didea.system.path="{self._system_dir}"'
+            system_dir = self._get_checked_system_dir()
+            os.makedirs(system_dir, exist_ok=True)
+            idea_system_path_opt = f'-Didea.system.path="{system_dir}"'
             jvm_options_full = f"{jvm_options} {idea_system_path_opt}".strip() if jvm_options else idea_system_path_opt
 
             env["JAVA_TOOL_OPTIONS"] = jvm_options_full

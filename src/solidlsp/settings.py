@@ -6,6 +6,9 @@ Defines settings for Solid-LSP
 import logging
 import os
 import pathlib
+from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Union
 
@@ -19,6 +22,125 @@ log = logging.getLogger(__name__)
 
 
 SOLIDLSP_RESOURCES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources")
+
+
+class WriteRefusal(Exception):
+    """
+    A write guard's refusal of a write (see :class:`WriteGuard`).
+    """
+
+
+@dataclass(frozen=True)
+class Rename:
+    """
+    A rename of a file (or directory).
+    """
+
+    old_path: str
+    """the absolute path renamed"""
+    new_path: str
+    """the absolute path it is renamed to"""
+
+
+@dataclass
+class WriteBatchPlan:
+    """
+    The writes a batch of writes to a project's files will make (see :meth:`WriteGuard.write_batch_context`).
+    """
+
+    file_paths: list[str] = field(default_factory=list)
+    """the absolute paths of the files whose contents the batch writes"""
+    renames: list[Rename] = field(default_factory=list)
+    """the renames the batch makes"""
+
+
+class WriteGuard(ABC):
+    """
+    The checks applied to the file system writes made on a project's behalf, right before each write.
+    """
+
+    @abstractmethod
+    def check_write(self, path: str) -> None:
+        """
+        Checks a write to the project's files (the repository).
+
+        :param path: the absolute path to be written to (created, modified, renamed or removed)
+        :raises WriteRefusal: if the write must not happen
+        """
+
+    def check_rename(self, old_path: str, new_path: str) -> None:
+        """
+        Checks a rename of one of the project's files (or directories).
+
+        :param old_path: the absolute path to be renamed
+        :param new_path: the absolute path it is to be renamed to
+        :raises WriteRefusal: if the rename must not happen
+        """
+        self.check_write(old_path)
+        self.check_write(new_path)
+
+    def check_entry_write(self, path: str) -> None:
+        """
+        Checks a write acting on the entry at a path of the project's files itself (e.g. its removal), which does not
+        follow the path's last component if it is a symbolic link. By default, it is checked as any write.
+
+        :param path: the absolute path of the entry
+        :raises WriteRefusal: if the write must not happen
+        """
+        self.check_write(path)
+
+    def check_data_entry_write(self, path: str) -> None:
+        """
+        Checks a write acting on the entry at a path of the project's data folder itself (e.g. its removal), which does
+        not follow the path's last component if it is a symbolic link. By default, it is checked as any data write.
+
+        :param path: the absolute path of the entry
+        :raises WriteRefusal: if the write must not happen
+        """
+        self.check_data_write(path)
+
+    def report_write(self, path: str) -> None:
+        """
+        Reports a write to one of the project's files, right after it was made (following :meth:`check_write`), so that
+        the guard can record what the write left. By default, nothing is recorded.
+
+        :param path: the absolute path written to
+        """
+
+    def report_rename(self, rename: Rename) -> None:
+        """
+        Reports a rename, right after it was made (following :meth:`check_rename`), so that the guard can record what
+        the rename left. By default, nothing is recorded.
+
+        :param rename: the rename
+        """
+
+    @contextmanager
+    def write_batch_context(self, plan: WriteBatchPlan) -> Iterator[None]:
+        """
+        Context manager for a batch of writes to the project's files (e.g. a language server's multi-file edit), checking
+        every one of them (see :meth:`check_write` and :meth:`check_rename`) before the first is made: a write refused
+        by this check causes no write at all. Each write is checked again as it is made; a write refused then is not
+        made, and whether the batch's earlier writes are rolled back is up to the guard (see overriding methods; by
+        default, they stay in place).
+
+        :param plan: the writes the batch will make
+        :raises WriteRefusal: if a write of the batch must not happen
+        """
+        for path in plan.file_paths:
+            self.check_write(path)
+        for rename in plan.renames:
+            self.check_rename(rename.old_path, rename.new_path)
+        yield
+
+    @abstractmethod
+    def check_data_write(self, path: str) -> None:
+        """
+        Checks a write to the project's data folder (e.g. a language server's cache folder or cache file).
+
+        :param path: the absolute path to be written to (created or modified)
+        :raises WriteRefusal: if the write must not happen
+        """
 
 
 @dataclass
@@ -45,6 +167,10 @@ class SolidLSPSettings:
     Maps language server identifiers or their string keys to a dictionary of options for that language server.
     See constructors of the corresponding LS implementations within SolidLSP to see which options are available.
     Some options are centrally supported. See Serena's documentation for details.
+    """
+    write_guard: WriteGuard | None = None
+    """
+    The checks to apply right before Solid-LSP writes to the repository or to the project data folder, if any.
     """
 
     def __post_init__(self) -> None:

@@ -58,7 +58,7 @@ from solidlsp.lsp_protocol_handler.server import (
     ProcessLaunchInfo,
     StringDict,
 )
-from solidlsp.settings import SolidLSPSettings
+from solidlsp.settings import SolidLSPSettings, WriteRefusal
 from solidlsp.util.cache import load_cache, save_cache
 from solidlsp.util.pickle_util import SafePickleLoader
 
@@ -564,6 +564,9 @@ class SolidLanguageServer(ABC):
 
         # initialise symbol caches
         self.cache_dir = Path(self._solidlsp_settings.project_data_path) / self.CACHE_FOLDER_NAME / self.ls_id.get_key()
+        for created_dir in (self.cache_dir.parent.parent, self.cache_dir.parent, self.cache_dir):
+            if not created_dir.is_dir():
+                self._check_data_write(str(created_dir))
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         # * raw document symbols cache
         self._ls_specific_raw_document_symbols_cache_version = cache_version_raw_document_symbols
@@ -3122,6 +3125,8 @@ class SolidLanguageServer(ABC):
             log.debug("No changes to raw document symbols cache, skipping save")
             return
 
+        if not self._is_cache_file_write_permitted(cache_file):
+            return
         log.info("Saving updated raw document symbols cache to %s", cache_file)
         try:
             save_cache(str(cache_file), self._raw_document_symbols_cache_version(), self._raw_document_symbols_cache)
@@ -3187,6 +3192,8 @@ class SolidLanguageServer(ABC):
             log.debug("No changes to document symbols cache, skipping save")
             return
 
+        if not self._is_cache_file_write_permitted(cache_file):
+            return
         log.info("Saving updated document symbols cache to %s", cache_file)
         try:
             save_cache(str(cache_file), self._document_symbols_cache_version(), self._document_symbols_cache)
@@ -3216,8 +3223,60 @@ class SolidLanguageServer(ABC):
                 )
 
     def save_cache(self) -> None:
+        """
+        Saves the symbol caches that have changed since they were loaded or last saved. A cache whose write the write
+        guard (see :attr:`SolidLSPSettings.write_guard`) refuses is not saved (and stays in memory); since the caches hold
+        derived data only, the refusal is logged rather than raised.
+        """
         self._save_raw_document_symbols_cache()
         self._save_document_symbols_cache()
+
+    def _check_write(self, path: str) -> None:
+        """
+        Checks, right before a write to the repository, that the write may happen.
+
+        :param path: the absolute path to be written to (created, modified, renamed or removed)
+        :raises WriteRefusal: if the write guard (see :attr:`SolidLSPSettings.write_guard`) refuses the write
+        """
+        write_guard = self._solidlsp_settings.write_guard
+        if write_guard is not None:
+            write_guard.check_write(path)
+
+    def _check_data_write(self, path: str) -> None:
+        """
+        Checks, right before a write to the project data folder, that the write may happen.
+
+        :param path: the absolute path to be written to (created or modified)
+        :raises WriteRefusal: if the write guard (see :attr:`SolidLSPSettings.write_guard`) refuses the write
+        """
+        write_guard = self._solidlsp_settings.write_guard
+        if write_guard is not None:
+            write_guard.check_data_write(path)
+
+    def _is_cache_file_write_permitted(self, cache_file: Path) -> bool:
+        """
+        :param cache_file: a cache file about to be written
+        :return: whether the write guard permits writing the file and the folders holding it; a refusal is logged
+        """
+        try:
+            for path in (cache_file.parent.parent, cache_file.parent, cache_file):
+                self._check_data_write(str(path))
+        except WriteRefusal as e:
+            log.warning("Not saving the cache file %s: %s", cache_file, e)
+            return False
+        return True
+
+    def _is_in_project_data_folder(self, path: str) -> bool:
+        """
+        :param path: an absolute path
+        :return: whether the path, as spelled, lies inside the project data folder (see
+            :attr:`SolidLSPSettings.project_data_path`), whose writes the write guard checks by its data rule
+        """
+        data_folder = os.path.normpath(self._solidlsp_settings.project_data_path)
+        try:
+            return os.path.commonpath([os.path.normpath(path), data_folder]) == data_folder
+        except ValueError:
+            return False
 
     def request_workspace_symbol(self, query: str) -> list[ls_types.UnifiedSymbolInformation] | None:
         """

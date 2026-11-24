@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -15,6 +16,7 @@ from sensai.util.string import ToStringMixin
 
 from serena.util.file_proxy import FileCollection, FileProxy
 from solidlsp.ls_utils import TextCoordinateProvider, TextCoordinates, TextUtils
+from solidlsp.settings import WriteBatchPlan
 
 if TYPE_CHECKING:
     from serena.code_editor import CodeEditor
@@ -935,7 +937,9 @@ class MultiFileReplacement:
 
     def apply(self, code_editor: "CodeEditor", occurrences: list[ReplacementOccurrence]) -> MultiFileReplacementResult:
         """
-        Applies the given (selected) occurrences.
+        Applies the given (selected) occurrences, as one batch of writes (see :meth:`Project.write_batch_context`): a
+        write the project's write guard refuses before the first file is modified causes no write at all; for a write
+        refused as it is made, see :meth:`WriteGuard.write_batch_context`.
 
         :param code_editor: the code editor through which to modify the files
         :param occurrences: the occurrences to replace (obtained from `select` or `select_all_guarded`)
@@ -949,24 +953,28 @@ class MultiFileReplacement:
         for occ in occurrences:
             occurrences_by_file.setdefault(occ.relative_path, []).append(occ)
 
-        for path, file_occurrences in occurrences_by_file.items():
-            with EditedFileContext(path, code_editor) as context:
-                original_content = context.get_original_content()
-                if original_content != self._contents[path]:
-                    # the editor's view differs from what was scanned (e.g. line-ending normalization);
-                    # re-derive the occurrences from the authoritative content and re-validate by id
-                    fresh_by_id = {
-                        o.occurrence_id: o
-                        for o in self._replacer.find_occurrences([(path, original_content)], self._needle, self._repl, self._output_paths)
-                    }
-                    try:
-                        file_occurrences = [fresh_by_id[o.occurrence_id] for o in file_occurrences]
-                    except KeyError as e:
-                        raise ValueError(
-                            f"The content of {self._output_paths.of(path)} changed while replacing (occurrence {e} no longer resolves); "
-                            f"the file was NOT modified. Re-run with dry_run=True for current ids."
-                        ) from e
-                context.set_updated_content(self._replacer.apply_to_content(original_content, file_occurrences))
+        plan = WriteBatchPlan(file_paths=[os.path.join(code_editor.project_root, path) for path in occurrences_by_file])
+        with code_editor.project.write_batch_context(plan):
+            for path, file_occurrences in occurrences_by_file.items():
+                with EditedFileContext(path, code_editor) as context:
+                    original_content = context.get_original_content()
+                    if original_content != self._contents[path]:
+                        # the editor's view differs from what was scanned (e.g. line-ending normalization);
+                        # re-derive the occurrences from the authoritative content and re-validate by id
+                        fresh_by_id = {
+                            o.occurrence_id: o
+                            for o in self._replacer.find_occurrences(
+                                [(path, original_content)], self._needle, self._repl, self._output_paths
+                            )
+                        }
+                        try:
+                            file_occurrences = [fresh_by_id[o.occurrence_id] for o in file_occurrences]
+                        except KeyError as e:
+                            raise ValueError(
+                                f"The content of {self._output_paths.of(path)} changed while replacing (occurrence {e} no longer "
+                                f"resolves); the file was NOT modified. Re-run with dry_run=True for current ids."
+                            ) from e
+                    context.set_updated_content(self._replacer.apply_to_content(original_content, file_occurrences))
 
         return MultiFileReplacementResult({self._output_paths.of(path): len(occs) for path, occs in occurrences_by_file.items()})
 

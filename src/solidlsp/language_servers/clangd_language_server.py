@@ -182,11 +182,15 @@ class ClangdLanguageServer(SolidLanguageServer):
             cpp_settings = self._custom_settings or {}
             compile_commands_rel_dir = cpp_settings.get("compile_commands_dir", ".serena")
             compile_commands_dir = os.path.join(self.repository_root_path, compile_commands_rel_dir)
+            check_write = self._check_data_write if self._is_in_project_data_folder(compile_commands_dir) else self._check_write
+            if not os.path.isdir(compile_commands_dir):
+                check_write(compile_commands_dir)
             os.makedirs(compile_commands_dir, exist_ok=True)
 
             # Write the transformed compile_commands.json
             # clangd looks for compile_commands.json in the --compile-commands-dir
             compile_commands_path = os.path.join(compile_commands_dir, "compile_commands.json")
+            check_write(compile_commands_path)
             with open(compile_commands_path, "w", encoding="utf-8") as f:
                 json.dump(compile_commands, f, indent=2)
 

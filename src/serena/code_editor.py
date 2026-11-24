@@ -14,6 +14,7 @@ from serena.symbol import JetBrainsSymbol, LanguageServerSymbol, LanguageServerS
 from solidlsp import SolidLanguageServer, ls_types
 from solidlsp.ls import LSPFileBuffer
 from solidlsp.ls_utils import PathUtils, TextStepper, TextUtils
+from solidlsp.settings import Rename, WriteBatchPlan
 
 from .project import Project
 from .util.file_proxy import FileProxy
@@ -94,7 +95,9 @@ class CodeEditor(Generic[TSymbol], ABC):
     def _save_edited_file(self, edited_file: "CodeEditor.EditedFile") -> None:
         abs_path = os.path.join(self.project_root, edited_file.relative_path)
         new_contents = edited_file.get_contents()
+        self.project.check_write(abs_path)
         write_file_atomic(abs_path, new_contents, encoding=self.encoding, newline=self.newline)
+        self.project.report_write(abs_path)
 
     @abstractmethod
     def _find_unique_symbol(self, name_path: str, relative_file_path: str) -> TSymbol:
@@ -348,6 +351,14 @@ class LanguageServerCodeEditor(CodeEditor[LanguageServerSymbol]):
 
     class EditOperation(ABC):
         @abstractmethod
+        def add_to_write_plan(self, plan: WriteBatchPlan) -> None:
+            """
+            Adds the writes the operation makes to a batch's plan.
+
+            :param plan: the plan
+            """
+
+        @abstractmethod
         def apply(self) -> None:
             pass
 
@@ -356,6 +367,9 @@ class LanguageServerCodeEditor(CodeEditor[LanguageServerSymbol]):
             self._code_editor = code_editor
             self._relative_path = code_editor._relative_path_from_uri(file_uri)
             self._text_edits = text_edits
+
+        def add_to_write_plan(self, plan: WriteBatchPlan) -> None:
+            plan.file_paths.append(os.path.join(self._code_editor.project_root, self._relative_path))
 
         def apply(self) -> None:
             with self._code_editor.edited_file_context(self._relative_path) as edited_file:
@@ -368,10 +382,20 @@ class LanguageServerCodeEditor(CodeEditor[LanguageServerSymbol]):
             self._old_relative_path = code_editor._relative_path_from_uri(old_uri)
             self._new_relative_path = code_editor._relative_path_from_uri(new_uri)
 
+        def _get_rename(self) -> Rename:
+            return Rename(
+                old_path=os.path.join(self._code_editor.project_root, self._old_relative_path),
+                new_path=os.path.join(self._code_editor.project_root, self._new_relative_path),
+            )
+
+        def add_to_write_plan(self, plan: WriteBatchPlan) -> None:
+            plan.renames.append(self._get_rename())
+
         def apply(self) -> None:
-            old_abs_path = os.path.join(self._code_editor.project_root, self._old_relative_path)
-            new_abs_path = os.path.join(self._code_editor.project_root, self._new_relative_path)
-            os.rename(old_abs_path, new_abs_path)
+            rename = self._get_rename()
+            self._code_editor.project.check_rename(rename.old_path, rename.new_path)
+            os.rename(rename.old_path, rename.new_path)
+            self._code_editor.project.report_rename(rename)
 
     def _workspace_edit_to_edit_operations(self, workspace_edit: ls_types.WorkspaceEdit) -> list["LanguageServerCodeEditor.EditOperation"]:
         operations: list[LanguageServerCodeEditor.EditOperation] = []
@@ -396,14 +420,20 @@ class LanguageServerCodeEditor(CodeEditor[LanguageServerSymbol]):
 
     def _apply_workspace_edit(self, workspace_edit: ls_types.WorkspaceEdit) -> int:
         """
-        Applies a WorkspaceEdit
+        Applies a WorkspaceEdit as one batch of writes (see :meth:`Project.write_batch_context`), whose writes are all
+        checked before the first one is applied: a write refused by that check causes no write at all; for a write
+        refused as it is made, see :meth:`WriteGuard.write_batch_context`.
 
         :param workspace_edit: the edit to apply
         :return: number of edit operations applied
         """
         operations = self._workspace_edit_to_edit_operations(workspace_edit)
+        plan = WriteBatchPlan()
         for operation in operations:
-            operation.apply()
+            operation.add_to_write_plan(plan)
+        with self.project.write_batch_context(plan):
+            for operation in operations:
+                operation.apply()
         return len(operations)
 
     def rename_symbol(self, name_path: str, relative_path: str, new_name: str) -> str:

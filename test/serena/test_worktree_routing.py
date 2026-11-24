@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from serena import code_editor as code_editor_module
 from serena.agent import SerenaAgent
 from serena.config.serena_config import ProjectConfig, RegisteredProject, SerenaConfig
 from serena.constants import PROJECT_TEMPLATE_FILE
@@ -30,6 +31,7 @@ from serena.tools import (
     GetSymbolsOverviewTool,
     ListDirTool,
     ReadFileTool,
+    RenameSymbolTool,
     ReplaceContentTool,
     ReplaceInFilesTool,
     ReplaceSymbolBodyTool,
@@ -38,6 +40,8 @@ from serena.tools import (
     Tool,
 )
 from serena.tools.tools_base import EditingToolWithDiagnostics
+from serena.worktree_routing import WorktreeRouter
+from solidlsp.ls import SolidLanguageServer
 from solidlsp.ls_config import LanguageServerId
 from test.conftest import get_pytest_markers, get_repo_path
 
@@ -51,6 +55,7 @@ PROJECT_NAME = "worktree_routing_repo"
 
 def make_project_config(project_name: str, **overrides: Any) -> ProjectConfig:
     settings: dict[str, Any] = {
+        "language_servers": [LanguageServerId.PYTHON],
         "ignored_paths": [],
         "excluded_tools": [],
         "read_only": False,
@@ -58,7 +63,6 @@ def make_project_config(project_name: str, **overrides: Any) -> ProjectConfig:
     }
     return ProjectConfig(
         project_name=project_name,
-        language_servers=[LanguageServerId.PYTHON],
         ignore_all_files_in_gitignore=True,
         initial_prompt="",
         encoding="utf-8",
@@ -145,17 +149,23 @@ def create_worktree_repo(base: Path) -> WorktreeRepo:
 
 @contextmanager
 def routing_agent(
-    project_root: Path, trusted_project_path_patterns: list[str] | None = None, **project_settings: Any
+    project_root: Path,
+    trusted_project_path_patterns: list[str] | None = None,
+    project_serena_folder_location: str | None = None,
+    **project_settings: Any,
 ) -> Iterator[SerenaAgent]:
     """
     Provides an agent with routing on, whose active project has the given root.
 
     :param trusted_project_path_patterns: the trusted project path patterns, if not the default (all paths)
+    :param project_serena_folder_location: the location template of projects' Serena data folders, if not the default
     :param project_settings: settings of the active project's configuration
     """
     config = SerenaConfig(log_level=logging.ERROR, tool_timeout=600, route_worktree_paths=True).with_headless_mode_overrides()
     if trusted_project_path_patterns is not None:
         config.trusted_project_path_patterns = trusted_project_path_patterns
+    if project_serena_folder_location is not None:
+        config.project_serena_folder_location = project_serena_folder_location
     project = Project(
         project_root=str(project_root),
         project_config=make_project_config(PROJECT_NAME, ignored_paths=[MAIN_ONLY_IGNORED_FILE], **project_settings),
@@ -241,6 +251,79 @@ def record_project_shutdowns(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
     monkeypatch.setattr(Project, "shutdown", recording_shutdown)
     return shut_down_roots
+
+
+@dataclass
+class ShutDownProject:
+    project: Project
+    language_servers: list[SolidLanguageServer]
+    """the project's language servers when its shutdown began"""
+
+    def are_servers_stopped(self) -> bool:
+        return all(not ls.is_running() for ls in self.language_servers)
+
+
+def record_shut_down_projects(monkeypatch: pytest.MonkeyPatch) -> list[ShutDownProject]:
+    """
+    :return: a list which receives every project shut down from now on, once its shutdown has completed
+    """
+    shut_down_projects: list[ShutDownProject] = []
+    original_shutdown = Project.shutdown
+
+    def recording_shutdown(project: Project, timeout: float = 2.0) -> None:
+        manager = project.language_server_manager
+        language_servers = list(manager.get_current_language_servers()) if manager is not None else []
+        original_shutdown(project, timeout=timeout)
+        shut_down_projects.append(ShutDownProject(project=project, language_servers=language_servers))
+
+    monkeypatch.setattr(Project, "shutdown", recording_shutdown)
+    return shut_down_projects
+
+
+def wait_for_length(items: list, length: int, timeout: float = 60) -> None:
+    """
+    Waits until a list, filled by another thread, has reached the given length, or the timeout has passed.
+    """
+    deadline = time.monotonic() + timeout
+    while len(items) < length and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+
+def is_running(project: Project) -> bool:
+    """
+    :return: whether all of the project's language servers are running
+    """
+    manager = project.language_server_manager
+    return manager is not None and all(ls.is_running() for ls in manager.get_current_language_servers())
+
+
+def recreate_worktree_in_place(main: Path, root: Path, branch: str, kept_dir: Path) -> None:
+    """
+    Removes a worktree and adds it again in the same, emptied directory, so that its root keeps its identity while its
+    git directory is a new one.
+
+    :param kept_dir: a directory to keep the old git directory in, so that the new one cannot take over its identity
+    """
+    git_dir = Path(git(root, "rev-parse", "--absolute-git-dir").strip())
+    for child in root.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+    shutil.move(git_dir, kept_dir)
+    git(main, "worktree", "add", "-q", str(root), branch)
+
+
+def recreate_worktree_at_same_path(main: Path, root: Path, branch: str, kept_dir: Path) -> None:
+    """
+    Removes a worktree and adds it again at the same path, keeping the old root and git directory (moved into
+    `kept_dir`), so that the new ones cannot take over their identities.
+    """
+    git_dir = Path(git(root, "rev-parse", "--absolute-git-dir").strip())
+    kept_dir.mkdir()
+    shutil.move(root, kept_dir / "root")
+    shutil.move(git_dir, kept_dir / "git-dir")
+    git(main, "worktree", "add", "-q", str(root), branch)
 
 
 def paths_under(result: str, root: Path) -> list[str]:
@@ -661,6 +744,7 @@ class TestWorktreeRouting:
         monkeypatch.setattr(Project, "shutdown", recording_shutdown)
         git(sibling.root, "checkout", "-q", "ignoring")
         result = call(agent, SearchForPatternTool, substring_pattern=sibling.marker, relative_path=str(sibling.root))
+        wait_for_length(shut_down_roots, 1)
         monkeypatch.undo()
         assert "models.py" not in result
         assert shut_down_roots == [str(sibling.root)]
@@ -1156,6 +1240,7 @@ class TestWorktreeRouting:
         with open(exclude, "a", encoding="utf-8") as f:
             f.write("unrelated-pattern\n")
         self.search_files(agent, root, "class User\\(")
+        wait_for_length(shut_down_roots, 1)
         monkeypatch.undo()
         assert shut_down_roots == [str(root)]
 
@@ -1165,3 +1250,1015 @@ class TestWorktreeRouting:
         sibling = worktree_repo.worktrees["sibling"]
         use_git_echoing_path_format(tmp_path, monkeypatch)
         assert sibling.marker in call(agent, GetSymbolsOverviewTool, relative_path=str(sibling.root / MODELS_FILE))
+
+    def test_worktree_languages_follow_its_configuration(self, agent: SerenaAgent, worktree_repo: WorktreeRepo) -> None:
+        root = worktree_repo.worktrees["sibling"].root
+        commit_worktree_config(root, language_servers=[LanguageServerId.PYTHON_TY])
+        sample = os.path.join("test_repo", "diagnostics_sample.py")
+
+        assert '"source": "ty"' in call(agent, GetDiagnosticsForFileTool, relative_path=str(root / sample))
+        assert '"source": "Pyright"' in call(agent, GetDiagnosticsForFileTool, relative_path=sample)
+
+    @pytest.mark.parametrize("directory", ["new_directory", "same_directory"])
+    def test_worktree_recreated_from_read_only_branch_refuses_next_edit(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, tmp_path: Path, directory: str
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        path = str(sibling.root / MODELS_FILE)
+
+        # prepare a read-only branch, leaving the worktree on its branch without a configuration of its own
+        git(sibling.root, "checkout", "-q", "-b", "read-only")
+        commit_worktree_config(sibling.root, read_only=True)
+        git(sibling.root, "checkout", "-q", "feature")
+        call(
+            agent,
+            ReplaceContentTool,
+            relative_path=path,
+            needle="class User(BaseModel):",
+            repl="class User(BaseModel):  # one",
+            mode="literal",
+        )
+        assert "class User(BaseModel):  # one" in worktree_repo.read_models(sibling.root)
+
+        # recreate the worktree at the same path from the read-only branch
+        if directory == "new_directory":
+            git(worktree_repo.main, "worktree", "remove", "--force", str(sibling.root))
+            git(worktree_repo.main, "worktree", "add", "-q", str(sibling.root), "read-only")
+        else:
+            recreate_worktree_in_place(worktree_repo.main, sibling.root, "read-only", tmp_path / "old-git-dir")
+        models_before = worktree_repo.read_models(sibling.root)
+
+        result = call(agent, ReplaceContentTool, relative_path=path, needle="class User(BaseModel):", repl="class Edited:", mode="literal")
+        assert "read_only" in result
+        assert worktree_repo.read_models(sibling.root) == models_before
+
+    def test_replace_content_works_as_first_call_and_after_replacement(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        path = str(sibling.root / MODELS_FILE)
+        main_before = snapshot_files(worktree_repo.main)
+        git(sibling.root, "checkout", "-q", "-b", "configured")
+        commit_worktree_config(sibling.root)
+        git(sibling.root, "checkout", "-q", "feature")
+
+        result = call(
+            agent,
+            ReplaceContentTool,
+            relative_path=path,
+            needle="class User(BaseModel):",
+            repl="class User(BaseModel):  # one",
+            mode="literal",
+        )
+        assert "class User(BaseModel):  # one" in worktree_repo.read_models(sibling.root), result
+
+        # change the worktree's configuration, which replaces its project
+        shut_down_roots = record_project_shutdowns(monkeypatch)
+        git(sibling.root, "checkout", "-q", "-f", "configured")
+        result = call(
+            agent,
+            ReplaceContentTool,
+            relative_path=path,
+            needle="class User(BaseModel):",
+            repl="class User(BaseModel):  # two",
+            mode="literal",
+        )
+        wait_for_length(shut_down_roots, 1)
+        monkeypatch.undo()
+        assert "class User(BaseModel):  # two" in worktree_repo.read_models(sibling.root), result
+        assert shut_down_roots == [str(sibling.root)]
+        assert snapshot_files(worktree_repo.main) == main_before
+
+    def test_timed_out_rename_keeps_its_project_until_its_thread_ends(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        path = str(sibling.root / MODELS_FILE)
+        services = sibling.root / "test_repo" / "services.py"
+        main_before = snapshot_files(worktree_repo.main)
+
+        # prepare a branch with a configuration of its own (which does not ignore the main-only ignored file), leaving
+        # the worktree on its branch, and start the worktree's project
+        git(sibling.root, "checkout", "-q", "-b", "configured")
+        commit_worktree_config(sibling.root)
+        git(sibling.root, "checkout", "-q", "feature")
+        assert sibling.marker in call(agent, GetSymbolsOverviewTool, relative_path=path)
+
+        # make the rename wait, once its project is pinned, until released
+        rename_tool = agent.get_tool(RenameSymbolTool)
+        original_apply = rename_tool.apply
+        rename_projects: list[Project] = []
+        may_proceed = threading.Event()
+        rename_finished = threading.Event()
+
+        def waiting_apply(**kwargs: Any) -> str:
+            rename_projects.append(agent.get_active_project_or_raise())
+            may_proceed.wait(timeout=120)
+            try:
+                return original_apply(**kwargs)
+            finally:
+                rename_finished.set()
+
+        monkeypatch.setattr(rename_tool, "apply", waiting_apply)
+        shut_down_projects = record_shut_down_projects(monkeypatch)
+
+        # let the rename time out, then change the configuration and call into the worktree again
+        agent.serena_config.tool_timeout = 1
+        try:
+            timed_out = call(agent, RenameSymbolTool, name_path="User", relative_path=path, new_name="Account")
+        finally:
+            agent.serena_config.tool_timeout = 600
+        assert "timed out" in timed_out
+        git(sibling.root, "checkout", "-q", "configured")
+        assert "VariableContainer" in call(agent, GetSymbolsOverviewTool, relative_path=str(sibling.root / MAIN_ONLY_IGNORED_FILE))
+        [rename_project] = rename_projects
+        assert all(shut_down.project is not rename_project for shut_down in shut_down_projects)
+        assert is_running(rename_project)
+
+        # the rename completes in full, and its project is shut down only after the rename's task has ended
+        may_proceed.set()
+        assert rename_finished.wait(timeout=120)
+        deadline = time.monotonic() + 60
+        while not any(shut_down.project is rename_project for shut_down in shut_down_projects) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        [rename_shutdown] = [shut_down for shut_down in shut_down_projects if shut_down.project is rename_project]
+        assert rename_shutdown.are_servers_stopped()
+        models = worktree_repo.read_models(sibling.root)
+        for reference in ("class Account(BaseModel):", "-> Account:", "return Account(", "class LoggableUser(Account, Loggable):"):
+            assert reference in models
+        services_text = services.read_text(encoding="utf-8")
+        for reference in ("from .models import Item, Account", "dict[str, Account]", "user = Account(", "-> list[Account]:"):
+            assert reference in services_text
+        assert snapshot_files(worktree_repo.main) == main_before
+
+        # later calls run against the fresh project
+        assert "VariableContainer" in call(agent, GetSymbolsOverviewTool, relative_path=str(sibling.root / MAIN_ONLY_IGNORED_FILE))
+
+    def test_worktree_projects_live_until_their_worktree_is_removed_or_the_agent_shuts_down(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worktrees = [
+            worktree_repo.worktrees["sibling"],
+            worktree_repo.worktrees["nested"],
+            Worktree(root=add_worktree(worktree_repo.main, "../wt3", "third", "third_only_function"), marker="third_only_function"),
+        ]
+        shut_down_projects = record_shut_down_projects(monkeypatch)
+
+        # use the worktrees in turn, twice
+        for worktree in worktrees * 2:
+            assert worktree.marker in call(agent, GetSymbolsOverviewTool, relative_path=str(worktree.root / MODELS_FILE))
+        assert shut_down_projects == []
+
+        # removing a worktree stops its servers at the next routed call into another worktree
+        removed = worktrees.pop()
+        git(worktree_repo.main, "worktree", "remove", "--force", str(removed.root))
+        assert worktrees[0].marker in call(agent, GetSymbolsOverviewTool, relative_path=str(worktrees[0].root / MODELS_FILE))
+        wait_for_length(shut_down_projects, 1)
+        assert [shut_down.project.project_root for shut_down in shut_down_projects] == [str(removed.root)]
+        assert shut_down_projects[0].are_servers_stopped()
+
+        # shutting down the agent stops the servers of the remaining worktrees
+        agent.on_shutdown(timeout=5)
+        worktree_shutdowns = [
+            shut_down for shut_down in shut_down_projects[1:] if shut_down.project.project_root != str(worktree_repo.main)
+        ]
+        assert sorted(shut_down.project.project_root for shut_down in worktree_shutdowns) == sorted(str(w.root) for w in worktrees)
+        assert all(shut_down.are_servers_stopped() for shut_down in worktree_shutdowns)
+
+    def test_worktree_recreated_in_place_stops_its_servers_at_next_routed_call(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        nested = worktree_repo.worktrees["nested"]
+        assert sibling.marker in call(agent, GetSymbolsOverviewTool, relative_path=str(sibling.root / MODELS_FILE))
+        shut_down_projects = record_shut_down_projects(monkeypatch)
+
+        recreate_worktree_in_place(worktree_repo.main, sibling.root, "feature", tmp_path / "old-git-dir")
+        assert nested.marker in call(agent, GetSymbolsOverviewTool, relative_path=str(nested.root / MODELS_FILE))
+        wait_for_length(shut_down_projects, 1)
+        assert [shut_down.project.project_root for shut_down in shut_down_projects] == [str(sibling.root)]
+        assert shut_down_projects[0].are_servers_stopped()
+        assert sibling.marker in call(agent, GetSymbolsOverviewTool, relative_path=str(sibling.root / MODELS_FILE))
+
+    @pytest.mark.parametrize("tool_name", ["rename_symbol", "get_symbols_overview"])
+    def test_timed_out_call_does_not_write_into_worktree_recreated_meanwhile(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool_name: str
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        nested = worktree_repo.worktrees["nested"]
+        path = str(sibling.root / MODELS_FILE)
+        main_before = snapshot_files(worktree_repo.main)
+        assert sibling.marker in call(agent, GetSymbolsOverviewTool, relative_path=path)
+
+        # make the call wait, once its project is pinned, until released
+        tool_class: type[Tool]
+        kwargs: dict[str, Any]
+        if tool_name == "rename_symbol":
+            tool_class, kwargs = RenameSymbolTool, {"name_path": "User", "relative_path": path, "new_name": "Account"}
+        else:
+            # a file whose symbols the project has not cached yet, so that the call's cache save has something to write
+            tool_class, kwargs = GetSymbolsOverviewTool, {"relative_path": str(sibling.root / "test_repo" / "services.py")}
+        waiting_tool = agent.get_tool(tool_class)
+        original_apply = waiting_tool.apply
+        apply_errors: list[Exception] = []
+        may_proceed = threading.Event()
+        apply_finished = threading.Event()
+
+        def waiting_apply(**apply_kwargs: Any) -> str:
+            may_proceed.wait(timeout=120)
+            try:
+                return original_apply(**apply_kwargs)
+            except Exception as e:
+                apply_errors.append(e)
+                raise
+            finally:
+                apply_finished.set()
+
+        monkeypatch.setattr(waiting_tool, "apply", waiting_apply)
+        shut_down_projects = record_shut_down_projects(monkeypatch)
+
+        # let the call time out, then recreate the worktree at the same path while the call still waits
+        agent.serena_config.tool_timeout = 1
+        try:
+            timed_out = call(agent, tool_class, **kwargs)
+        finally:
+            agent.serena_config.tool_timeout = 600
+        assert "timed out" in timed_out
+        recreate_worktree_at_same_path(worktree_repo.main, sibling.root, "feature", tmp_path / "old-worktree")
+        recreated_before = snapshot_files(sibling.root)
+
+        # none of the call's writes land in the new checkout (or the main checkout); a rename fails at its first write
+        may_proceed.set()
+        assert apply_finished.wait(timeout=120)
+        assert snapshot_files(sibling.root) == recreated_before
+        assert snapshot_files(worktree_repo.main) == main_before
+        if tool_name == "rename_symbol":
+            assert len(apply_errors) == 1
+            assert "removed or replaced" in str(apply_errors[0])
+
+        # neither the call's cache save nor the old project's shutdown writes to the new checkout's Serena data folder
+        assert nested.marker in call(agent, GetSymbolsOverviewTool, relative_path=str(nested.root / MODELS_FILE))
+        wait_for_length(shut_down_projects, 1)
+        assert [shut_down.project.project_root for shut_down in shut_down_projects] == [str(sibling.root)]
+        assert shut_down_projects[0].are_servers_stopped()
+        assert not (sibling.root / ".serena").exists()
+
+    def test_edit_and_deletion_of_loaded_gitignore_in_submodule_take_effect(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, tmp_path: Path
+    ) -> None:
+        root = worktree_repo.worktrees["sibling"].root
+
+        # a submodule of the worktree, whose own .gitignore Serena loads
+        source = tmp_path / "submodule-source"
+        source.mkdir()
+        (source / "vendored_module.py").write_text("class VendoredThing:\n    pass\n", encoding="utf-8")
+        (source / ".gitignore").write_text("nothing_here.txt\n", encoding="utf-8")
+        git(source, "init", "-q", "-b", "main")
+        git(source, "add", "-A")
+        git(source, "commit", "-qm", "initial")
+        git(root, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(source), "vendored")
+        git(root, "commit", "-qm", "add a submodule")
+        submodule_gitignore = root / "vendored" / ".gitignore"
+        assert "vendored_module.py" in self.search_files(agent, root, "class VendoredThing")
+
+        submodule_gitignore.write_text("vendored_module.py\n", encoding="utf-8")
+        assert "vendored_module.py" not in self.search_files(agent, root, "class VendoredThing")
+
+        submodule_gitignore.unlink()
+        assert "vendored_module.py" in self.search_files(agent, root, "class VendoredThing")
+
+    def test_worktree_data_folder_configured_outside_the_worktree_holds_its_caches(
+        self, worktree_repo: WorktreeRepo, tmp_path: Path
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        data_root = tmp_path / "serena-data"
+        path = str(sibling.root / MODELS_FILE)
+
+        with routing_agent(worktree_repo.main, project_serena_folder_location=str(data_root / "$projectFolderName")) as agent:
+            assert sibling.marker in call(agent, GetSymbolsOverviewTool, relative_path=path)
+            result = call(
+                agent,
+                ReplaceContentTool,
+                relative_path=path,
+                needle="class User(BaseModel):",
+                repl="class User(BaseModel):  # one",
+                mode="literal",
+            )
+            assert "class User(BaseModel):  # one" in worktree_repo.read_models(sibling.root), result
+            assert "UserService" in call(agent, GetSymbolsOverviewTool, relative_path=str(sibling.root / "test_repo" / "services.py"))
+
+        assert list((data_root / sibling.root.name / "cache").rglob("*.pkl"))
+        assert not (sibling.root / ".serena").exists()
+
+    def test_cache_folder_swapped_for_a_link_out_of_the_worktree_is_not_written_through(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, tmp_path: Path
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        assert sibling.marker in call(agent, GetSymbolsOverviewTool, relative_path=str(sibling.root / MODELS_FILE))
+
+        # replace the cache folders of the worktree's project with a link to a directory outside the worktree
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        cache_folder = sibling.root / ".serena" / "cache"
+        shutil.rmtree(cache_folder)
+        cache_folder.symlink_to(outside, target_is_directory=True)
+
+        # calls whose cache saves have something to write succeed without the caches being written through the link,
+        # and so do later calls, whether or not they write anything
+        assert "UserService" in call(agent, GetSymbolsOverviewTool, relative_path=str(sibling.root / "test_repo" / "services.py"))
+        assert "class User" in call(agent, ReadFileTool, relative_path=str(sibling.root / MODELS_FILE))
+        assert "Item" in call(agent, FindSymbolTool, name_path_pattern="Item", relative_path=str(sibling.root / MODELS_FILE))
+        assert list(outside.iterdir()) == []
+
+    def test_timed_out_edit_is_refused_after_checkout_to_read_only_branch(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        path = str(sibling.root / MODELS_FILE)
+        main_before = snapshot_files(worktree_repo.main)
+
+        # prepare a read-only branch, leaving the worktree on its branch without a configuration of its own
+        git(sibling.root, "checkout", "-q", "-b", "read-only")
+        commit_worktree_config(sibling.root, read_only=True)
+        git(sibling.root, "checkout", "-q", "feature")
+        assert sibling.marker in call(agent, GetSymbolsOverviewTool, relative_path=path)
+
+        # make the rename wait, once its project is pinned, until released
+        rename_tool = agent.get_tool(RenameSymbolTool)
+        original_apply = rename_tool.apply
+        rename_errors: list[Exception] = []
+        may_proceed = threading.Event()
+        rename_finished = threading.Event()
+
+        def waiting_apply(**kwargs: Any) -> str:
+            may_proceed.wait(timeout=120)
+            try:
+                return original_apply(**kwargs)
+            except Exception as e:
+                rename_errors.append(e)
+                raise
+            finally:
+                rename_finished.set()
+
+        monkeypatch.setattr(rename_tool, "apply", waiting_apply)
+
+        # let the rename time out, then check the read-only branch out in the worktree while the rename still waits
+        agent.serena_config.tool_timeout = 1
+        try:
+            timed_out = call(agent, RenameSymbolTool, name_path="User", relative_path=path, new_name="Account")
+        finally:
+            agent.serena_config.tool_timeout = 600
+        assert "timed out" in timed_out
+        git(sibling.root, "checkout", "-q", "-f", "read-only")
+        checked_out = snapshot_files(sibling.root)
+
+        # the rename's writes are refused, naming the setting, and neither checkout changes
+        may_proceed.set()
+        assert rename_finished.wait(timeout=120)
+        assert len(rename_errors) == 1
+        assert "read_only" in str(rename_errors[0])
+        assert snapshot_files(sibling.root) == checked_out
+        assert snapshot_files(worktree_repo.main) == main_before
+
+    def test_worktree_projects_survive_a_call_while_a_project_of_another_repository_is_active(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        assert sibling.marker in call(agent, GetSymbolsOverviewTool, relative_path=str(sibling.root / MODELS_FILE))
+
+        # a project of another repository, made active as on activating it
+        other = create_worktree_repo(tmp_path / "other")
+        other_project = Project(
+            project_root=str(other.main), project_config=make_project_config("other_repo"), serena_config=agent.serena_config
+        )
+        other_project.create_language_server_manager()
+        shut_down_projects = record_shut_down_projects(monkeypatch)
+        try:
+            with agent.active_project_context(other_project):
+                assert "User" in call(agent, GetSymbolsOverviewTool, relative_path=str(other.main / MODELS_FILE))
+
+            # the worktree's project was neither removed nor replaced, so its servers keep running
+            wait_for_length(shut_down_projects, 1, timeout=3)
+            assert shut_down_projects == []
+            assert sibling.marker in call(agent, GetSymbolsOverviewTool, relative_path=str(sibling.root / MODELS_FILE))
+            wait_for_length(shut_down_projects, 1, timeout=3)
+            assert shut_down_projects == []
+        finally:
+            monkeypatch.undo()
+            other_project.shutdown()
+
+    def test_rename_edit_with_a_target_outside_the_worktree_leaves_the_worktree_unchanged(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        path = str(sibling.root / MODELS_FILE)
+        outside_file = tmp_path / "outside.py"
+        outside_file.write_text("def outside_function() -> None:\n    pass\n", encoding="utf-8")
+        sibling_before = snapshot_files(sibling.root)
+
+        # a language server whose rename edit changes a file of the worktree first, then one outside it
+        def outside_reaching_rename_edit(self: SolidLanguageServer, **kwargs: Any) -> dict:
+            insertion = {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "newText": "# renamed\n"}
+            return {"changes": {Path(path).as_uri(): [insertion], outside_file.as_uri(): [insertion]}}
+
+        monkeypatch.setattr(SolidLanguageServer, "request_rename_symbol_edit", outside_reaching_rename_edit)
+
+        result = call(agent, RenameSymbolTool, name_path="User", relative_path=path, new_name="Account")
+        assert "Refusing to write" in result
+        assert snapshot_files(sibling.root) == sibling_before
+        assert outside_file.read_text(encoding="utf-8") == "def outside_function() -> None:\n    pass\n"
+
+    def test_data_folder_linked_out_of_the_worktree_is_refused(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, tmp_path: Path
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        outside = tmp_path / "outside-data"
+        outside.mkdir()
+        link = sibling.root / ".serena"
+        link.symlink_to(outside, target_is_directory=True)
+
+        result = call(agent, GetSymbolsOverviewTool, relative_path=str(sibling.root / MODELS_FILE))
+        assert sibling.marker not in result
+        assert str(link) in result
+        assert list(outside.iterdir()) == []
+
+    def test_timed_out_replace_in_files_is_refused_after_checkout_to_read_only_branch(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        main_before = snapshot_files(worktree_repo.main)
+
+        # prepare a read-only branch, leaving the worktree on its branch without a configuration of its own
+        git(sibling.root, "checkout", "-q", "-b", "read-only")
+        commit_worktree_config(sibling.root, read_only=True)
+        git(sibling.root, "checkout", "-q", "feature")
+        assert sibling.marker in call(agent, GetSymbolsOverviewTool, relative_path=str(sibling.root / MODELS_FILE))
+
+        # make the replacement wait, once its project is pinned, until released
+        replace_tool = agent.get_tool(ReplaceInFilesTool)
+        original_apply = replace_tool.apply
+        replace_errors: list[Exception] = []
+        may_proceed = threading.Event()
+        replace_finished = threading.Event()
+
+        def waiting_apply(**kwargs: Any) -> str:
+            may_proceed.wait(timeout=120)
+            try:
+                return original_apply(**kwargs)
+            except Exception as e:
+                replace_errors.append(e)
+                raise
+            finally:
+                replace_finished.set()
+
+        monkeypatch.setattr(replace_tool, "apply", waiting_apply)
+
+        # let the replacement time out, then check the read-only branch out in the worktree while it still waits
+        agent.serena_config.tool_timeout = 1
+        try:
+            timed_out = call(agent, ReplaceInFilesTool, needle="User", repl="Account", mode="literal", relative_path=str(sibling.root))
+        finally:
+            agent.serena_config.tool_timeout = 600
+        assert "timed out" in timed_out
+        git(sibling.root, "checkout", "-q", "-f", "read-only")
+        checked_out = snapshot_files(sibling.root)
+
+        # the replacement's writes are refused before any is made, naming the setting
+        may_proceed.set()
+        assert replace_finished.wait(timeout=120)
+        assert len(replace_errors) == 1
+        assert "read_only" in str(replace_errors[0])
+        assert snapshot_files(sibling.root) == checked_out
+        assert snapshot_files(worktree_repo.main) == main_before
+
+    def _make_read_only_after_first_write(
+        self,
+        worktree_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        after_first_write: Callable[[], None] | None = None,
+        write_number: int = 1,
+    ) -> list[str]:
+        """
+        Makes the editors' writes call `after_first_write` (by default, commit a read_only configuration to the worktree)
+        right after their write numbered `write_number` (by default, the first).
+
+        :return: a list which receives the path of each write the editors make
+        """
+        original_write = code_editor_module.write_file_atomic
+        written_paths: list[str] = []
+
+        def write_then_change(path: str, content: str, **kwargs: Any) -> None:
+            original_write(path, content, **kwargs)
+            written_paths.append(path)
+            if len(written_paths) == write_number:
+                if after_first_write is None:
+                    commit_worktree_config(worktree_root, read_only=True)
+                else:
+                    after_first_write()
+
+        monkeypatch.setattr(code_editor_module, "write_file_atomic", write_then_change)
+        return written_paths
+
+    @staticmethod
+    def _fake_two_file_rename_edit(monkeypatch: pytest.MonkeyPatch, first: Path, second: Path) -> None:
+        """
+        Makes the language server's rename edit insert a line into two files, in this order.
+        """
+
+        def two_file_rename_edit(self: SolidLanguageServer, **kwargs: Any) -> dict:
+            insertion = {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "newText": "# renamed\n"}
+            return {"changes": {first.as_uri(): [insertion], second.as_uri(): [insertion]}}
+
+        monkeypatch.setattr(SolidLanguageServer, "request_rename_symbol_edit", two_file_rename_edit)
+
+    def test_configuration_change_during_a_rename_batch_rolls_it_back(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A rename's writes are checked against the configuration as now on disk before the first and again at each write;
+        a write refused mid-batch for the configuration (here, read_only, committed after the first file is written)
+        rolls the batch's earlier writes back, so the worktree is left as before the batch.
+        """
+        sibling = worktree_repo.worktrees["sibling"]
+        models = sibling.root / MODELS_FILE
+        services = sibling.root / "test_repo" / "services.py"
+        self._fake_two_file_rename_edit(monkeypatch, models, services)
+        before = snapshot_files(sibling.root)
+        written_paths = self._make_read_only_after_first_write(sibling.root, monkeypatch)
+
+        result = call(agent, RenameSymbolTool, name_path="User", relative_path=str(models), new_name="Account")
+        assert len(written_paths) == 1, result
+        assert "read_only" in result
+        assert "rolled back" in result
+        assert snapshot_files(sibling.root) == before
+
+    def test_configuration_change_during_a_replace_in_files_batch_rolls_it_back(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        As for a rename: a replace_in_files write refused mid-batch for the configuration rolls the batch's earlier
+        writes back, so the worktree is left as before the batch.
+        """
+        sibling = worktree_repo.worktrees["sibling"]
+        for path in (sibling.root / MODELS_FILE, sibling.root / "test_repo" / "services.py"):
+            path.write_text("# batch marker\n" + path.read_text(encoding="utf-8"), encoding="utf-8")
+        before = snapshot_files(sibling.root)
+        written_paths = self._make_read_only_after_first_write(sibling.root, monkeypatch)
+
+        result = call(
+            agent, ReplaceInFilesTool, needle="# batch marker", repl="# batch done", mode="literal", relative_path=str(sibling.root)
+        )
+        assert len(written_paths) == 1, result
+        assert "read_only" in result
+        assert "rolled back" in result
+        assert snapshot_files(sibling.root) == before
+
+    def test_worktree_replaced_during_a_rename_batch_rolls_nothing_back(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A rename write refused mid-batch because the worktree was replaced rolls nothing back: the batch's earlier write
+        stays in the old checkout, and the new one is not written to.
+        """
+        sibling = worktree_repo.worktrees["sibling"]
+        models = sibling.root / MODELS_FILE
+        services = sibling.root / "test_repo" / "services.py"
+        self._fake_two_file_rename_edit(monkeypatch, models, services)
+        kept_dir = tmp_path / "old-worktree"
+        written_paths = self._make_read_only_after_first_write(
+            sibling.root,
+            monkeypatch,
+            after_first_write=lambda: recreate_worktree_at_same_path(worktree_repo.main, sibling.root, "feature", kept_dir),
+        )
+
+        result = call(agent, RenameSymbolTool, name_path="User", relative_path=str(models), new_name="Account")
+        assert len(written_paths) == 1, result
+        assert "removed or replaced" in result
+        assert "rolled back" not in result
+        assert "stay in place" in result
+        assert (kept_dir / "root" / MODELS_FILE).read_text(encoding="utf-8").startswith("# renamed\n")
+        assert not models.read_text(encoding="utf-8").startswith("# renamed\n")
+        assert not services.read_text(encoding="utf-8").startswith("# renamed\n")
+
+    @staticmethod
+    def _fake_rename_edit(monkeypatch: pytest.MonkeyPatch, document_changes: list[dict]) -> None:
+        """
+        Makes the language server's rename edit consist of the given document changes.
+        """
+
+        def rename_edit(self: SolidLanguageServer, **kwargs: Any) -> dict:
+            return {"documentChanges": document_changes}
+
+        monkeypatch.setattr(SolidLanguageServer, "request_rename_symbol_edit", rename_edit)
+
+    @staticmethod
+    def _insertion_into(path: Path) -> dict:
+        insertion = {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "newText": "# renamed\n"}
+        return {"textDocument": {"uri": path.as_uri(), "version": None}, "edits": [insertion]}
+
+    def test_configuration_change_during_a_batch_with_a_rename_rolls_the_rename_back(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        models = sibling.root / MODELS_FILE
+        utils = sibling.root / "test_repo" / "utils.py"
+        self._fake_rename_edit(
+            monkeypatch,
+            [
+                {"kind": "rename", "oldUri": utils.as_uri(), "newUri": (utils.parent / "renamed_utils.py").as_uri()},
+                self._insertion_into(models),
+                self._insertion_into(sibling.root / "test_repo" / "services.py"),
+            ],
+        )
+        before = snapshot_files(sibling.root)
+        written_paths = self._make_read_only_after_first_write(sibling.root, monkeypatch)
+
+        result = call(agent, RenameSymbolTool, name_path="User", relative_path=str(models), new_name="Account")
+        assert len(written_paths) == 1, result
+        assert "read_only" in result
+        assert "rolled back" in result
+        assert snapshot_files(sibling.root) == before
+
+    def test_path_turned_into_a_symlink_after_its_batch_write_is_not_written_through_on_rollback(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        models = sibling.root / MODELS_FILE
+        precious = sibling.root / "precious.txt"
+        precious.write_text("untracked and precious\n", encoding="utf-8")
+        self._fake_rename_edit(
+            monkeypatch, [self._insertion_into(models), self._insertion_into(sibling.root / "test_repo" / "services.py")]
+        )
+
+        # after the batch's first write, turn the written file into a link to another file of the worktree, and make
+        # the configuration read_only
+        def link_and_make_read_only() -> None:
+            models.unlink()
+            models.symlink_to(precious)
+            commit_worktree_config(sibling.root, read_only=True)
+
+        written_paths = self._make_read_only_after_first_write(sibling.root, monkeypatch, after_first_write=link_and_make_read_only)
+
+        result = call(agent, RenameSymbolTool, name_path="User", relative_path=str(models), new_name="Account")
+        assert len(written_paths) == 1, result
+        assert "read_only" in result
+        assert f"{models}, which are left changed" in result
+        assert precious.read_text(encoding="utf-8") == "untracked and precious\n"
+        assert models.is_symlink()
+
+    def test_rename_onto_an_existing_file_is_refused_before_any_write(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        models = sibling.root / MODELS_FILE
+        services = sibling.root / "test_repo" / "services.py"
+        self._fake_rename_edit(
+            monkeypatch,
+            [
+                self._insertion_into(models),
+                {"kind": "rename", "oldUri": (sibling.root / "test_repo" / "utils.py").as_uri(), "newUri": services.as_uri()},
+            ],
+        )
+        before = snapshot_files(sibling.root)
+
+        result = call(agent, RenameSymbolTool, name_path="User", relative_path=str(models), new_name="Account")
+        assert f"{services} already exists" in result
+        assert snapshot_files(sibling.root) == before
+
+    def test_configuration_change_after_editing_a_renamed_file_rolls_back_both(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        utils = sibling.root / "test_repo" / "utils.py"
+        renamed_utils = utils.parent / "renamed_utils.py"
+        self._fake_rename_edit(
+            monkeypatch,
+            [
+                {"kind": "rename", "oldUri": utils.as_uri(), "newUri": renamed_utils.as_uri()},
+                self._insertion_into(renamed_utils),
+                self._insertion_into(sibling.root / "test_repo" / "services.py"),
+            ],
+        )
+        before = snapshot_files(sibling.root)
+        written_paths = self._make_read_only_after_first_write(sibling.root, monkeypatch)
+
+        result = call(agent, RenameSymbolTool, name_path="User", relative_path=str(sibling.root / MODELS_FILE), new_name="Account")
+        assert len(written_paths) == 1, result
+        assert "rolled back" in result
+        assert snapshot_files(sibling.root) == before
+
+    def test_rename_target_appearing_mid_batch_rolls_the_batch_back(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        models = sibling.root / MODELS_FILE
+        target = sibling.root / "test_repo" / "renamed_utils.py"
+        self._fake_rename_edit(
+            monkeypatch,
+            [
+                self._insertion_into(models),
+                {"kind": "rename", "oldUri": (sibling.root / "test_repo" / "utils.py").as_uri(), "newUri": target.as_uri()},
+            ],
+        )
+
+        # the rename's target, free at the pre-check, appears after the batch's first write
+        written_paths = self._make_read_only_after_first_write(
+            sibling.root, monkeypatch, after_first_write=lambda: target.write_text("# appeared\n", encoding="utf-8")
+        )
+
+        result = call(agent, RenameSymbolTool, name_path="User", relative_path=str(models), new_name="Account")
+        assert len(written_paths) == 1, result
+        assert f"{target} already exists" in result
+        assert "rolled back" in result
+        assert not models.read_text(encoding="utf-8").startswith("# renamed\n")
+
+    def test_data_folder_turning_into_a_link_out_of_the_worktree_before_the_build_is_refused(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        outside = tmp_path / "outside-data"
+        outside.mkdir()
+        (sibling.root / ".serena").symlink_to(outside, target_is_directory=True)
+
+        # the link appears after the check made before the build
+        monkeypatch.setattr(WorktreeRouter, "_check_data_folder_location", lambda self, project_root: None)
+
+        result = call(agent, GetSymbolsOverviewTool, relative_path=str(sibling.root / MODELS_FILE))
+        assert sibling.marker not in result
+        assert "leads out of the worktree" in result
+        assert not (outside / "cache").exists()
+
+    def test_rollback_after_editing_renaming_and_editing_a_file_again_restores_it(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        utils = sibling.root / "test_repo" / "utils.py"
+        renamed_utils = utils.parent / "renamed_utils.py"
+        self._fake_rename_edit(
+            monkeypatch,
+            [
+                self._insertion_into(utils),
+                {"kind": "rename", "oldUri": utils.as_uri(), "newUri": renamed_utils.as_uri()},
+                self._insertion_into(renamed_utils),
+                self._insertion_into(sibling.root / "test_repo" / "services.py"),
+            ],
+        )
+        before = snapshot_files(sibling.root)
+        written_paths = self._make_read_only_after_first_write(sibling.root, monkeypatch, write_number=2)
+
+        result = call(agent, RenameSymbolTool, name_path="User", relative_path=str(sibling.root / MODELS_FILE), new_name="Account")
+        assert len(written_paths) == 2, result
+        assert "rolled back" in result
+        assert snapshot_files(sibling.root) == before
+
+    def test_rollback_across_a_directory_rename_restores_the_files_beneath_it(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        package = sibling.root / "pkg"
+        package.mkdir()
+        (package / "module.py").write_text("def packaged_function() -> None:\n    pass\n", encoding="utf-8")
+        renamed_package = sibling.root / "renamed_pkg"
+        self._fake_rename_edit(
+            monkeypatch,
+            [
+                self._insertion_into(package / "module.py"),
+                {"kind": "rename", "oldUri": package.as_uri(), "newUri": renamed_package.as_uri()},
+                self._insertion_into(renamed_package / "module.py"),
+                self._insertion_into(sibling.root / "test_repo" / "services.py"),
+            ],
+        )
+        before = snapshot_files(sibling.root)
+        written_paths = self._make_read_only_after_first_write(sibling.root, monkeypatch, write_number=2)
+
+        result = call(agent, RenameSymbolTool, name_path="User", relative_path=str(sibling.root / MODELS_FILE), new_name="Account")
+        assert len(written_paths) == 2, result
+        assert "rolled back" in result
+        assert snapshot_files(sibling.root) == before
+
+    @pytest.mark.parametrize("tool_name", ["replace_content", "create_text_file"])
+    @pytest.mark.parametrize("change", ["recreated", "read_only"])
+    def test_timed_out_single_file_write_is_refused_at_the_sink(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool_name: str, change: str
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        main_before = snapshot_files(worktree_repo.main)
+        if change == "read_only":
+            git(sibling.root, "checkout", "-q", "-b", "read-only")
+            commit_worktree_config(sibling.root, read_only=True)
+            git(sibling.root, "checkout", "-q", "feature")
+        assert sibling.marker in call(agent, GetSymbolsOverviewTool, relative_path=str(sibling.root / MODELS_FILE))
+
+        tool_class: type[Tool]
+        kwargs: dict[str, Any]
+        if tool_name == "replace_content":
+            tool_class = ReplaceContentTool
+            kwargs = {
+                "relative_path": str(sibling.root / MODELS_FILE),
+                "needle": "class User(BaseModel):",
+                "repl": "class Edited:",
+                "mode": "literal",
+            }
+        else:
+            tool_class = CreateTextFileTool
+            kwargs = {"relative_path": str(sibling.root / "created.txt"), "content": "created\n"}
+
+        # make the call wait, once its project is pinned, until released
+        waiting_tool = agent.get_tool(tool_class)
+        original_apply = waiting_tool.apply
+        apply_errors: list[Exception] = []
+        may_proceed = threading.Event()
+        apply_finished = threading.Event()
+
+        def waiting_apply(**apply_kwargs: Any) -> str:
+            may_proceed.wait(timeout=120)
+            try:
+                return original_apply(**apply_kwargs)
+            except Exception as e:
+                apply_errors.append(e)
+                raise
+            finally:
+                apply_finished.set()
+
+        monkeypatch.setattr(waiting_tool, "apply", waiting_apply)
+
+        # let the call time out, then change the worktree while it waits
+        agent.serena_config.tool_timeout = 1
+        try:
+            assert "timed out" in call(agent, tool_class, **kwargs)
+        finally:
+            agent.serena_config.tool_timeout = 600
+        if change == "recreated":
+            recreate_worktree_at_same_path(worktree_repo.main, sibling.root, "feature", tmp_path / "old-worktree")
+        else:
+            git(sibling.root, "checkout", "-q", "-f", "read-only")
+        changed_before = snapshot_files(sibling.root)
+
+        # the write is refused at its sink, and neither checkout changes
+        may_proceed.set()
+        assert apply_finished.wait(timeout=120)
+        assert len(apply_errors) == 1
+        assert ("removed or replaced" if change == "recreated" else "read_only") in str(apply_errors[0])
+        assert snapshot_files(sibling.root) == changed_before
+        assert snapshot_files(worktree_repo.main) == main_before
+
+    def test_rename_of_an_entry_behind_a_directory_link_out_of_the_worktree_is_refused(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        utils = sibling.root / "test_repo" / "utils.py"
+
+        # a directory link out of the worktree, holding a link back to a file of the worktree
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "link").symlink_to(utils)
+        (sibling.root / "out").symlink_to(outside, target_is_directory=True)
+        self._fake_rename_edit(
+            monkeypatch,
+            [{"kind": "rename", "oldUri": (sibling.root / "out" / "link").as_uri(), "newUri": (sibling.root / "moved").as_uri()}],
+        )
+        before = snapshot_files(sibling.root)
+
+        result = call(agent, RenameSymbolTool, name_path="User", relative_path=str(sibling.root / MODELS_FILE), new_name="Account")
+        assert "does not lie inside the git worktree" in result
+        assert (outside / "link").is_symlink()
+        assert not os.path.lexists(sibling.root / "moved")
+        assert snapshot_files(sibling.root) == before
+
+    def test_case_only_rename_routes_and_rolls_back(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        utils = sibling.root / "test_repo" / "utils.py"
+        if not os.path.exists(utils.parent / "UTILS.PY"):
+            pytest.skip("the file system is case-sensitive, so a case-only rename is an ordinary rename there")
+        self._fake_rename_edit(
+            monkeypatch,
+            [
+                {"kind": "rename", "oldUri": utils.as_uri(), "newUri": (utils.parent / "Utils.py").as_uri()},
+                self._insertion_into(sibling.root / "test_repo" / "services.py"),
+                self._insertion_into(sibling.root / MODELS_FILE),
+            ],
+        )
+        before = snapshot_files(sibling.root)
+        written_paths = self._make_read_only_after_first_write(sibling.root, monkeypatch)
+
+        result = call(agent, RenameSymbolTool, name_path="User", relative_path=str(sibling.root / MODELS_FILE), new_name="Account")
+        assert len(written_paths) == 1, result
+        assert "rolled back" in result
+        assert snapshot_files(sibling.root) == before
+
+    def test_rollback_after_a_path_is_vacated_and_reoccupied_restores_both_files(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        package = sibling.root / "test_repo"
+        b_path, c_path = package / "b_module.py", package / "c_module.py"
+        self._fake_rename_edit(
+            monkeypatch,
+            [
+                {"kind": "rename", "oldUri": (package / "utils.py").as_uri(), "newUri": b_path.as_uri()},
+                self._insertion_into(b_path),
+                {"kind": "rename", "oldUri": b_path.as_uri(), "newUri": c_path.as_uri()},
+                {"kind": "rename", "oldUri": (package / "models.py").as_uri(), "newUri": b_path.as_uri()},
+                self._insertion_into(b_path),
+                self._insertion_into(package / "services.py"),
+            ],
+        )
+        before = snapshot_files(sibling.root)
+        written_paths = self._make_read_only_after_first_write(sibling.root, monkeypatch, write_number=2)
+
+        result = call(agent, RenameSymbolTool, name_path="User", relative_path=str(sibling.root / MODELS_FILE), new_name="Account")
+        assert len(written_paths) == 2, result
+        assert "rolled back" in result
+        assert snapshot_files(sibling.root) == before
+
+    def test_rename_of_the_worktree_root_itself_is_refused(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        self._fake_rename_edit(
+            monkeypatch, [{"kind": "rename", "oldUri": sibling.root.as_uri(), "newUri": (sibling.root / "moved").as_uri()}]
+        )
+        before = snapshot_files(sibling.root)
+
+        result = call(agent, RenameSymbolTool, name_path="User", relative_path=str(sibling.root / MODELS_FILE), new_name="Account")
+        assert "does not lie inside the git worktree" in result
+        assert snapshot_files(sibling.root) == before
+
+    def test_renames_of_a_batch_are_checked_in_their_order(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        package = sibling.root / "test_repo"
+        services_before = (package / "services.py").read_bytes()
+        models_before = (package / "models.py").read_bytes()
+
+        # a target that holds an entry is free once an earlier rename of the batch has moved it away
+        self._fake_rename_edit(
+            monkeypatch,
+            [
+                {"kind": "rename", "oldUri": (package / "services.py").as_uri(), "newUri": (package / "moved_services.py").as_uri()},
+                {"kind": "rename", "oldUri": (package / "models.py").as_uri(), "newUri": (package / "services.py").as_uri()},
+            ],
+        )
+        result = call(agent, RenameSymbolTool, name_path="User", relative_path=str(package / "models.py"), new_name="Account")
+        assert "already exists" not in result, result
+        assert (package / "moved_services.py").read_bytes() == services_before
+        assert (package / "services.py").read_bytes() == models_before
+
+        # a target taken by an earlier rename of the batch is not free
+        self._fake_rename_edit(
+            monkeypatch,
+            [
+                {"kind": "rename", "oldUri": (package / "utils.py").as_uri(), "newUri": (package / "b_module.py").as_uri()},
+                {"kind": "rename", "oldUri": (package / "services.py").as_uri(), "newUri": (package / "b_module.py").as_uri()},
+            ],
+        )
+        before = snapshot_files(sibling.root)
+        result = call(agent, RenameSymbolTool, name_path="User", relative_path=str(package / "services.py"), new_name="Account")
+        assert f"{package / 'b_module.py'} already exists" in result
+        assert "rolled back" not in result, "refused at the pre-check, before any write"
+        assert snapshot_files(sibling.root) == before
+
+    def test_data_folder_gitignore_linked_out_of_the_worktree_is_never_written_through(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, tmp_path: Path
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        absent_outside = tmp_path / "outside" / "absent.txt"
+        absent_outside.parent.mkdir()
+        (sibling.root / ".serena").mkdir()
+        link = sibling.root / ".serena" / ".gitignore"
+        link.symlink_to(absent_outside)
+
+        result = call(agent, GetSymbolsOverviewTool, relative_path=str(sibling.root / MODELS_FILE))
+        assert sibling.marker not in result
+        assert str(link) in result
+        assert not os.path.lexists(absent_outside)
+
+    def test_rollback_restores_a_file_reached_through_a_link_in_a_renamed_directory(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+        target = sibling.root / "target.py"
+        target.write_text("def target_function() -> None:\n    pass\n", encoding="utf-8")
+        (sibling.root / "old").mkdir()
+        (sibling.root / "old" / "link.py").symlink_to(Path("..") / "target.py")
+        self._fake_rename_edit(
+            monkeypatch,
+            [
+                {"kind": "rename", "oldUri": (sibling.root / "old").as_uri(), "newUri": (sibling.root / "new").as_uri()},
+                self._insertion_into(sibling.root / "new" / "link.py"),
+                self._insertion_into(sibling.root / "test_repo" / "services.py"),
+            ],
+        )
+        target_before = target.read_bytes()
+        before = snapshot_files(sibling.root)
+        written_paths = self._make_read_only_after_first_write(sibling.root, monkeypatch)
+
+        result = call(agent, RenameSymbolTool, name_path="User", relative_path=str(sibling.root / MODELS_FILE), new_name="Account")
+        assert len(written_paths) == 1, result
+        assert "rolled back" in result
+        assert target.read_bytes() == target_before
+        assert (sibling.root / "old" / "link.py").is_symlink()
+        assert snapshot_files(sibling.root) == before

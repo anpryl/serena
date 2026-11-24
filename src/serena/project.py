@@ -3,7 +3,8 @@
 import logging
 import os
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
@@ -25,6 +26,7 @@ from serena.util.file_system import GitignoreParser, ScanResult, dir_entry_from_
 from serena.util.text_utils import MatchedConsecutiveLines, search_files
 from solidlsp import SolidLanguageServer
 from solidlsp.ls_config import LanguageServerIdLike
+from solidlsp.settings import Rename, WriteBatchPlan, WriteGuard, WriteRefusal
 
 if TYPE_CHECKING:
     from serena.agent import SerenaAgent
@@ -97,6 +99,7 @@ class Project(ToStringMixin):
         serena_config: SerenaConfig,
         is_newly_created: bool = False,
         absolute_output_paths: bool = False,
+        write_guard: WriteGuard | None = None,
     ):
         """
         :param project_root: path to the project's root folder; it is assumed to be fully resolved
@@ -105,8 +108,10 @@ class Project(ToStringMixin):
         :param is_newly_created: whether the project was newly created
         :param absolute_output_paths: whether results name the project's files by absolute path (see :attr:`output_paths`)
             instead of relative to the project root
+        :param write_guard: the check to apply before each write to the project's files (see :meth:`check_write`), if any
         """
         assert serena_config is not None
+        self._write_guard = write_guard
         self.project_root = project_root
         self.output_paths = OutputPaths(absolute_root=project_root if absolute_output_paths else None)
         """the paths by which results name the project's files"""
@@ -117,6 +122,11 @@ class Project(ToStringMixin):
 
         read_only_memory_patterns = serena_config.read_only_memory_patterns + project_config.read_only_memory_patterns
         ignored_memory_patterns = serena_config.ignored_memory_patterns + project_config.ignored_memory_patterns
+        if write_guard is not None:
+            # the memory manager creates the data and memories folders (mkdir, which does not follow a link in its place)
+            for created_dir in (self._serena_data_folder, os.path.join(self._serena_data_folder, "memories")):
+                if not os.path.lexists(created_dir):
+                    write_guard.check_data_entry_write(created_dir)
         self.memory_manager = MemoryManager(
             self._serena_data_folder,
             read_only_memory_patterns=read_only_memory_patterns,
@@ -133,12 +143,14 @@ class Project(ToStringMixin):
 
         # create .gitignore file in the project's Serena data folder if not yet present
         serena_data_gitignore_path = os.path.join(self._serena_data_folder, ".gitignore")
-        if not os.path.exists(serena_data_gitignore_path):
+        gitignore_content = f"/{SolidLanguageServer.CACHE_FOLDER_NAME}\n/{ProjectConfig.SERENA_LOCAL_PROJECT_FILE}\n"
+        if write_guard is not None:
+            self._create_guarded_data_gitignore(serena_data_gitignore_path, gitignore_content, write_guard)
+        elif not os.path.exists(serena_data_gitignore_path):
             os.makedirs(os.path.dirname(serena_data_gitignore_path), exist_ok=True)
             log.info(f"Creating .gitignore file in {serena_data_gitignore_path}")
             with open(serena_data_gitignore_path, "w", encoding="utf-8") as f:
-                f.write(f"/{SolidLanguageServer.CACHE_FOLDER_NAME}\n")
-                f.write(f"/{ProjectConfig.SERENA_LOCAL_PROJECT_FILE}\n")
+                f.write(gitignore_content)
 
         # prepare ignore spec asynchronously, ensuring immediate project activation.
         self.__ignored_patterns: list[str] | None = None
@@ -192,6 +204,103 @@ class Project(ToStringMixin):
                 log.error(f"Error while gathering ignore spec for project {self.project_config.project_name}: {e}", exc_info=e)
 
         self._ignore_spec_available.set()
+
+    @staticmethod
+    def _create_guarded_data_gitignore(path: str, content: str, write_guard: WriteGuard) -> None:
+        """
+        Creates the Serena data folder's .gitignore file if no entry exists at its path, checked by the write guard and
+        never written through a symbolic link at its path.
+
+        :param path: the absolute path of the file
+        :param content: the file's contents
+        :param write_guard: the project's write guard
+        :raises WriteRefusal: if a symbolic link is at the path, or the write guard refuses creating the file
+        """
+        if os.path.lexists(path):
+            if os.path.islink(path):
+                raise WriteRefusal(f"Refusing to use {path}: it is a symbolic link, which is never written through.")
+            return
+        write_guard.check_data_entry_write(path)
+        log.info(f"Creating .gitignore file in {path}")
+        # exclusive creation, not following a link that may have appeared at the path since
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o666)
+        except FileExistsError:
+            # created meanwhile: a regular file is as good as ours, a symbolic link is refused
+            if os.path.islink(path):
+                raise WriteRefusal(f"Refusing to use {path}: it is a symbolic link, which is never written through.") from None
+            return
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    def check_write(self, path: str) -> None:
+        """
+        Checks, right before a tool writes to the project's files, that the write may happen.
+
+        :param path: the absolute path to be written to (created, modified, renamed or removed)
+        :raises Exception: if the project's write guard refuses the write
+        """
+        if self._write_guard is not None:
+            self._write_guard.check_write(path)
+
+    def check_rename(self, old_path: str, new_path: str) -> None:
+        """
+        Checks, right before a tool renames one of the project's files (or directories), that the rename may happen.
+
+        :param old_path: the absolute path to be renamed
+        :param new_path: the absolute path it is to be renamed to
+        :raises Exception: if the project's write guard refuses the rename
+        """
+        if self._write_guard is not None:
+            self._write_guard.check_rename(old_path, new_path)
+
+    def report_write(self, path: str) -> None:
+        """
+        Reports a write to the project's files to the project's write guard (if any), right after it was made (see
+        :meth:`WriteGuard.report_write`).
+
+        :param path: the absolute path written to
+        """
+        if self._write_guard is not None:
+            self._write_guard.report_write(path)
+
+    def report_rename(self, rename: Rename) -> None:
+        """
+        Reports a rename of one of the project's files to the project's write guard (if any), right after it was made
+        (see :meth:`WriteGuard.report_rename`).
+
+        :param rename: the rename
+        """
+        if self._write_guard is not None:
+            self._write_guard.report_rename(rename)
+
+    @contextmanager
+    def write_batch_context(self, plan: WriteBatchPlan) -> Iterator[None]:
+        """
+        Context manager for a batch of writes to the project's files, which the project's write guard (if any) checks
+        before the first is made (see :meth:`WriteGuard.write_batch_context`).
+
+        :param plan: the writes the batch will make
+        :raises WriteRefusal: if the project's write guard refuses a write of the batch
+        """
+        if self._write_guard is None:
+            yield
+            return
+        with self._write_guard.write_batch_context(plan):
+            yield
+
+    def save_language_server_caches(self) -> None:
+        """
+        Saves the caches of the project's language servers (if any) unless they were saved recently (see
+        :meth:`LanguageServerManager.save_all_caches_if_due`), logging a failure to save them (a cache whose write the
+        project's write guard refuses is not saved, see :meth:`SolidLanguageServer.save_cache`).
+        """
+        if self.language_server_manager is None:
+            return
+        try:
+            self.language_server_manager.save_all_caches_if_due()
+        except Exception as e:
+            log.error(f"Error saving language server cache: {e}")
 
     def get_read_ignore_file_digests(self) -> dict[str, str]:
         """
@@ -760,6 +869,7 @@ class Project(ToStringMixin):
                 ls_specific_settings=ls_specific_settings,
                 trace_lsp_communication=self.serena_config.trace_lsp_communication,
                 is_project_trusted=is_trusted,
+                write_guard=self._write_guard,
             )
             self.language_server_manager = LanguageServerManager.from_languages(self.project_config.language_servers, factory, self)
             return self.language_server_manager
@@ -849,6 +959,8 @@ class Project(ToStringMixin):
     def shutdown(self, timeout: float = 2.0) -> None:
         """
         Shuts down the project, calling the language backend-specific shutdown of the active project.
+        The language servers' caches are saved where the project's write guard permits it; the language servers are
+        stopped either way, and none is started.
 
         :param timeout: the timeout, in seconds
         """

@@ -230,6 +230,7 @@ class FsApi(FacadeApi):
         project.validate_relative_path(relative_path)
 
         # write the file
+        project.check_write(str(abs_path))
         abs_path.parent.mkdir(parents=True, exist_ok=True)
         abs_path.write_text(content, encoding=project.project_config.encoding, newline=project.line_ending.newline_str)
         answer = f"File created: {project.output_paths.of(relative_path)}."

@@ -246,7 +246,7 @@ class Tool(Component):
 
     def _log_tool_application(self, frame: Any) -> None:
         params = {}
-        ignored_params = {"self", "log_call", "catch_exceptions", "args", "apply_fn", "routes"}
+        ignored_params = {"self", "log_call", "catch_exceptions", "args", "apply_fn", "routes", "route"}
         for param, value in frame.f_locals.items():
             if param in ignored_params:
                 continue
@@ -326,36 +326,43 @@ class Tool(Component):
 
         def task() -> str:
             apply_fn = self.get_apply_fn()
+            route: WorktreeRoute | None = None
 
             try:
-                if not self.is_active():
-                    raise ToolCallError(
-                        f"Tool '{self.get_name_from_cls()}' is not active. Active tools: {self.agent.get_active_tool_names()}"
-                    )
-
-                if log_call:
-                    self._log_tool_application(inspect.currentframe())
-
-                # determine whether the call is routed to another git worktree of the active project's repository
-                route = self.agent.get_worktree_router().route(self, kwargs)
-                if route is not None:
-                    routes.append(route)
-            except ToolCallError:
-                raise
-            except WorktreeRoutingRefusal as e:
-                raise ToolCallError(str(e)) from e
-            except Exception as e:
-                msg = f"{e.__class__.__name__}: {e}"
-                log.error(msg, exc_info=e)
-                raise ToolCallError(msg)
-
-            if route is None:
-                return self._apply_in_active_project(apply_fn, kwargs, log_call)
-            with self.agent.thread_project_context(route.project):
                 try:
-                    return self._apply_in_active_project(apply_fn, route.kwargs, log_call)
-                except ToolCallError as e:
-                    raise ToolCallError(route.annotate_error(e.get_error_message())) from e
+                    if not self.is_active():
+                        raise ToolCallError(
+                            f"Tool '{self.get_name_from_cls()}' is not active. Active tools: {self.agent.get_active_tool_names()}"
+                        )
+
+                    if log_call:
+                        self._log_tool_application(inspect.currentframe())
+
+                    # determine whether the call is routed to another git worktree of the active project's repository
+                    route = self.agent.get_worktree_router().route(self, kwargs)
+                    if route is not None:
+                        routes.append(route)
+                except ToolCallError:
+                    raise
+                except WorktreeRoutingRefusal as e:
+                    raise ToolCallError(str(e)) from e
+                except Exception as e:
+                    msg = f"{e.__class__.__name__}: {e}"
+                    log.error(msg, exc_info=e)
+                    raise ToolCallError(msg)
+
+                if route is None:
+                    return self._apply_in_active_project(apply_fn, kwargs, log_call)
+                with self.agent.thread_project_context(route.project):
+                    try:
+                        return self._apply_in_active_project(apply_fn, route.kwargs, log_call)
+                    except ToolCallError as e:
+                        raise ToolCallError(route.annotate_error(e.get_error_message())) from e
+            finally:
+                # the routed project stays pinned until the task's thread really ends, which, for a timed-out call, is after
+                # this method has returned
+                if route is not None:
+                    route.release()
 
         # execute the tool in the agent's task executor, with timeout
         # (task timeout bounds task execution in the dispatcher once it runs, result timeout limits the time we wait)
@@ -431,12 +438,9 @@ class Tool(Component):
         if log_call:
             log.info(f"Result: {result}")
 
-        try:
-            ls_manager = self.agent.get_language_server_manager()
-            if ls_manager is not None:
-                ls_manager.save_all_caches_if_due()
-        except Exception as e:
-            log.error(f"Error saving language server cache: {e}")
+        project = self.agent.get_active_project()
+        if project is not None:
+            project.save_language_server_caches()
 
         return result
 

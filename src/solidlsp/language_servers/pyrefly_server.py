@@ -71,6 +71,7 @@ class PyreflyLanguageServer(SolidLanguageServer):
         pyproject_config_path = os.path.join(self.repository_root_path, "pyproject.toml")
 
         if not os.path.exists(pyrefly_config_path) and not os.path.exists(pyproject_config_path):
+            self._check_write(pyrefly_config_path)
             try:
                 pathlib.Path(pyrefly_config_path).touch()
                 log.warning(

@@ -13,7 +13,23 @@ from solidlsp.language_servers.kotlin_language_server import (
     KotlinLanguageServer,
 )
 from solidlsp.ls_utils import PlatformId
-from solidlsp.settings import SolidLSPSettings
+from solidlsp.settings import SolidLSPSettings, WriteGuard, WriteRefusal
+
+
+class _DirectoryWriteGuard(WriteGuard):
+    """
+    A write guard permitting data writes only inside one directory (by real path).
+    """
+
+    def __init__(self, directory: Path):
+        self._directory = os.path.realpath(directory)
+
+    def check_write(self, path: str) -> None:
+        raise WriteRefusal(f"no repository writes expected: {path}")
+
+    def check_data_write(self, path: str) -> None:
+        if os.path.commonpath([os.path.realpath(path), self._directory]) != self._directory:
+            raise WriteRefusal(f"Refusing to write {path}")
 
 
 def _make_provider(
@@ -170,6 +186,104 @@ class TestKotlinDependencyProvider:
             assert not os.path.exists(second.storage_dir)
         finally:
             first.release_storage_lock()
+
+    def test_overlapping_fallback_instances_keep_their_own_storage_dirs(self, tmp_path: Path) -> None:
+        """Two fallback instances of one process (e.g. a server pinned by a running task beside two
+        successive replacements) must not share a storage directory, so that releasing one leaves the
+        other's index in place.
+        """
+        primary = _make_provider(tmp_path)
+        second = _make_provider(tmp_path)
+        third = _make_provider(tmp_path)
+        try:
+            assert len({primary.storage_dir, second.storage_dir, third.storage_dir}) == 3
+            index_marker = Path(third.storage_dir) / "index-marker"
+            index_marker.write_text("kotlin lsp index data", encoding="utf-8")
+
+            second.release_storage_lock()
+
+            assert not os.path.exists(second.storage_dir)
+            assert index_marker.exists()
+        finally:
+            primary.release_storage_lock()
+            second.release_storage_lock()
+            third.release_storage_lock()
+
+    def test_system_dir_linked_out_of_the_data_folder_is_refused(self, tmp_path: Path) -> None:
+        """An existing system directory that is a link out of the guarded data folder is refused before it is
+        handed to the Kotlin LSP process, which would write its index through it.
+        """
+        data_folder = tmp_path / "data"
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (data_folder / "project-cache").mkdir(parents=True)
+        (data_folder / "project-cache" / "kotlin-lsp-system").symlink_to(outside, target_is_directory=True)
+        provider = KotlinLanguageServer.DependencyProvider(
+            custom_settings=SolidLSPSettings.CustomLSSettings({}),
+            ls_resources_dir=str(tmp_path / "resources"),
+            project_cache_dir=str(data_folder / "project-cache"),
+            write_guard=_DirectoryWriteGuard(data_folder),
+        )
+        try:
+            with pytest.raises(WriteRefusal):
+                provider.create_launch_command_env()
+            assert list(outside.iterdir()) == []
+        finally:
+            provider.release_storage_lock()
+
+    def test_storage_dir_linked_out_of_the_data_folder_is_refused_and_its_lock_released(self, tmp_path: Path) -> None:
+        """A primary storage directory that is a link out of the guarded data folder is refused before it is handed to
+        the Kotlin LSP process, and the lock acquired for it is released again.
+        """
+        data_folder = tmp_path / "data"
+        data_folder.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (data_folder / "project-cache").symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(WriteRefusal):
+            KotlinLanguageServer.DependencyProvider(
+                custom_settings=SolidLSPSettings.CustomLSSettings({}),
+                ls_resources_dir=str(tmp_path / "resources"),
+                project_cache_dir=str(data_folder / "project-cache"),
+                write_guard=_DirectoryWriteGuard(data_folder),
+            )
+
+        assert list(outside.iterdir()) == []
+        unguarded = KotlinLanguageServer.DependencyProvider(
+            custom_settings=SolidLSPSettings.CustomLSSettings({}),
+            ls_resources_dir=str(tmp_path / "resources"),
+            project_cache_dir=str(data_folder / "project-cache"),
+        )
+        try:
+            assert unguarded.storage_dir == str(data_folder / "project-cache")
+        finally:
+            unguarded.release_storage_lock()
+
+    def test_fallback_storage_dir_refused_by_the_write_guard_is_not_created(self, tmp_path: Path) -> None:
+        """The fallback directory of an instance whose primary directory is held by another is checked before it is
+        created. It is a sibling of the primary directory and of its lock file, so it cannot be linked out of the data
+        folder on its own; the guard here refuses it by name.
+        """
+
+        class _InstanceDirRefusingGuard(_DirectoryWriteGuard):
+            def check_data_write(self, path: str) -> None:
+                if "-instance-" in os.path.basename(path):
+                    raise WriteRefusal(f"Refusing to write {path}")
+                super().check_data_write(path)
+
+        primary = _make_provider(tmp_path)
+        try:
+            with pytest.raises(WriteRefusal):
+                KotlinLanguageServer.DependencyProvider(
+                    custom_settings=SolidLSPSettings.CustomLSSettings({}),
+                    ls_resources_dir=str(tmp_path),
+                    project_cache_dir=str(tmp_path / "project-cache"),
+                    write_guard=_InstanceDirRefusingGuard(tmp_path),
+                )
+            assert [p.name for p in tmp_path.iterdir() if "-instance-" in p.name] == []
+        finally:
+            primary.release_storage_lock()
 
     def test_primary_storage_dir_survives_release(self, tmp_path: Path) -> None:
         """The deterministic per-project directory must persist after release: it is the

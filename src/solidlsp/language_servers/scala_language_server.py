@@ -693,6 +693,9 @@ class ScalaLanguageServer(SolidLanguageServer):
 
             if on_stale_lock == StaleLockMode.AUTO_CLEAN:
                 log.info(f"Stale Metals lock detected, cleaning up: {lock_path_str}")
+                # this runs before the base class's initialisation, so the guard is taken from the given settings
+                if solidlsp_settings.write_guard is not None:
+                    solidlsp_settings.write_guard.check_entry_write(lock_path_str)
                 cleanup_success = cleanup_stale_lock(lock_path)
                 if not cleanup_success:
                     log.warning(

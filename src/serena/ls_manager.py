@@ -14,7 +14,7 @@ from serena.config.serena_config import ProjectConfig, SerenaPaths
 from solidlsp import SolidLanguageServer
 from solidlsp.ls_config import LanguageServerConfig, LanguageServerIdLike
 from solidlsp.lsp_protocol_handler.lsp_types import DidChangeWatchedFilesParams, FileChangeType, FileEvent
-from solidlsp.settings import SolidLSPSettings
+from solidlsp.settings import SolidLSPSettings, WriteGuard
 
 if TYPE_CHECKING:
     from .project import Project
@@ -39,6 +39,7 @@ class LanguageServerFactory:
         ls_specific_settings: dict | None = None,
         trace_lsp_communication: bool = False,
         is_project_trusted: bool = True,
+        write_guard: WriteGuard | None = None,
     ):
         self.project_root = project_root
         self.project_config = project_config
@@ -49,6 +50,7 @@ class LanguageServerFactory:
         self.ls_specific_settings = ls_specific_settings
         self.trace_lsp_communication = trace_lsp_communication
         self.is_project_trusted = is_project_trusted
+        self.write_guard = write_guard
 
     def create_language_server(self, ls_id: LanguageServerIdLike) -> SolidLanguageServer:
         ls_config = LanguageServerConfig(
@@ -70,6 +72,7 @@ class LanguageServerFactory:
                 solidlsp_dir=SerenaPaths().serena_user_home_dir,
                 project_data_path=self.project_data_path,
                 ls_specific_settings=self.ls_specific_settings or {},
+                write_guard=self.write_guard,
             ),
         )
 
@@ -255,8 +258,20 @@ class LanguageServerManager:
 
     @staticmethod
     def _stop_language_server(ls: SolidLanguageServer, save_cache: bool = False, timeout: float = 2.0) -> None:
+        """
+        Stops a language server, never starting one. One that is no longer running is stopped as well, releasing any
+        processes it left behind.
+
+        :param ls: the language server
+        :param save_cache: whether to save its cache first, if it is running; a failure to save it (including a write
+            guard's refusal) is logged, and the language server is stopped regardless
+        :param timeout: the timeout for its shutdown
+        """
         if save_cache and ls.is_running():
-            ls.save_cache()
+            try:
+                ls.save_cache()
+            except Exception as e:
+                log.warning(f"Not saving the cache of the language server for language {ls.ls_id}: {e}")
         log.info(f"Stopping language server for language {ls.ls_id} ...")
         ls.stop(shutdown_timeout=timeout)
 
@@ -264,21 +279,31 @@ class LanguageServerManager:
         for ls in self._language_servers.values():
             yield self._ensure_functional_ls(ls)
 
+    def get_current_language_servers(self) -> list[SolidLanguageServer]:
+        """
+        :return: the managed language servers as they are, not restarting any that is no longer running (unlike
+            :meth:`iter_language_servers`)
+        """
+        return list(self._language_servers.values())
+
     def stop_all(self, save_cache: bool = False, timeout: float = 2.0) -> None:
         """
-        Stops all managed language servers.
+        Stops all managed language servers (a language server that is no longer running is stopped without being
+        restarted).
 
-        :param save_cache: whether to save the cache before stopping
+        :param save_cache: whether to save the cache of each running one before stopping it (where the project's write
+            guard permits it)
         :param timeout: timeout for shutdown of each language server
         """
-        for ls in self._language_servers.values():
+        for ls in self.get_current_language_servers():
             self._stop_language_server(ls, save_cache=save_cache, timeout=timeout)
 
     def save_all_caches(self) -> None:
         """
-        Saves the caches of all managed language servers.
+        Saves the caches of all managed language servers that are running (a language server that is no longer running
+        is not restarted).
         """
-        for ls in self.iter_language_servers():
+        for ls in self.get_current_language_servers():
             if ls.is_running():
                 ls.save_cache()
         self._last_cache_save_time = time.monotonic()
