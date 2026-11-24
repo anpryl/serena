@@ -31,6 +31,7 @@ For reliable cross-file reference finding with clangd, your `compile_commands.js
 
 By default, Serena automatically downloads and manages clangd. Since clangd does not properly work with relative paths in `compile_commands.json`,
 Serena will detect them and transform them into absolute paths automatically (writing a new `compile_commands.json` file), if needed.
+In untrusted projects (and routed worktree projects), a `compile_commands.json` linked from outside the project is ignored instead: Serena does not read it, and clangd runs without a compilation database (an Unreal Engine project fails to start, as with a missing one).
 
 #### Customizing the Compilation Database Location
 

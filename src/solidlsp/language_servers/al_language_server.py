@@ -18,7 +18,7 @@ from overrides import override
 
 from solidlsp import ls_types
 from solidlsp.language_servers.common import quote_windows_path
-from solidlsp.ls import DocumentSymbols, LSPFileBuffer, RawDocumentSymbol, SolidLanguageServer
+from solidlsp.ls import DocumentSymbols, FixedPathFile, LSPFileBuffer, RawDocumentSymbol, SolidLanguageServer
 from solidlsp.ls_config import LanguageServerConfig, LanguageServerId
 from solidlsp.ls_types import SymbolKind, UnifiedSymbolInformation
 from solidlsp.ls_utils import FileUtils
@@ -520,6 +520,16 @@ class ALLanguageServer(SolidLanguageServer):
 
         return initialize_params
 
+    def _find_app_json(self) -> FixedPathFile | None:
+        """
+        :return: the repository's app.json (the AL project manifest), whose content is sent to the server at startup, or
+            None if there is none, it is not a regular file, or it resolves out of the repository through a symbolic link
+            that the configuration does not follow
+        """
+        if not (Path(self.repository_root_path) / "app.json").exists():
+            return None
+        return self._resolve_readable_fixed_path_file("app.json")
+
     @override
     def _start_server(self) -> None:
         """
@@ -634,17 +644,17 @@ class ALLanguageServer(SolidLanguageServer):
         except Exception as e:
             log.warning(f"Failed to send workspace config: {e}")
 
-        # Check if app.json exists and open it
+        # Open app.json if there is one that may be read (see _find_app_json)
         # app.json is the AL project manifest file (similar to package.json for Node.js)
         # Opening it triggers AL to load the project and index all AL files
-        app_json_path = Path(self.repository_root_path) / "app.json"
-        if app_json_path.exists():
+        app_json = self._find_app_json()
+        if app_json is not None:
             try:
-                with open(app_json_path, encoding="utf-8") as f:
+                with open(app_json.real_path, encoding="utf-8") as f:
                     app_json_content = f.read()
 
                 # Use forward slashes for URI
-                app_json_uri = app_json_path.as_uri()
+                app_json_uri = Path(app_json.path).as_uri()
 
                 # Send textDocument/didOpen for app.json
                 self.server.send_notification(
@@ -722,7 +732,8 @@ class ALLanguageServer(SolidLanguageServer):
         This is different from most language servers which can provide symbols for unopened files.
 
         This method:
-        1. Scans the repository for all AL files (.al and .dal extensions)
+        1. Scans the repository (or the given directory) for all AL files (.al and .dal extensions), leaving out files
+           reached through a symbolic link below the scan's start unless the configuration follows links
         2. Opens each file with the AL server
         3. Requests symbols for each file
         4. Combines all symbols into a hierarchical tree structure
@@ -767,6 +778,10 @@ class ALLanguageServer(SolidLanguageServer):
             for file in files:
                 if file.endswith((".al", ".dal")):
                     file_path = Path(root) / file
+                    # below its start, the walk never descends into links to directories, whatever the configuration;
+                    # links to files below the start are kept only where the configuration follows links
+                    if self._is_reached_through_unfollowed_link(file_path, start=scan_root):
+                        continue
                     # Use forward slashes for consistent paths
                     try:
                         relative_path = str(file_path.relative_to(self.repository_root_path)).replace("\\", "/")

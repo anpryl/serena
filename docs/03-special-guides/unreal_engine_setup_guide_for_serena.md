@@ -24,7 +24,9 @@ file by default; this guide shows how to obtain it.
 If clangd starts in a project that has a `.uproject` file but no usable
 `compile_commands.json`, Serena fails the language server startup with an error that
 inlines the command below, because clangd cannot resolve engine headers or reflection
-macros without the database. Pick one of the following routes to create it.
+macros without the database. Pick one of the following routes to create it. (In untrusted
+projects and routed worktree projects, a database linked from outside the project is ignored,
+so it fails the startup in the same way as a missing one; see the `-OutputDir` note below.)
 
 None of these routes change how you build. You still compile with MSVC. A clang toolchain,
 where a route uses one, only generates the database that clangd reads.
@@ -46,7 +48,9 @@ LLVM download. UnrealBuildTool auto-detects it at `VC\Tools\Llvm\x64`.
 - UE 5.7 expects clang in roughly the 18.1.8 to 20.1.8 range, and the VS component is
   matched. A newer standalone (e.g. 22.x) still generates the database but prints
   `Clang compiler version ... is not a preferred version`.
-- `-OutputDir` is required. Without it the file lands in the engine root.
+- `-OutputDir` is required. Without it the file lands in the engine root. Copy it from there rather than linking to
+  it: in untrusted projects (and routed worktree projects), Serena ignores a `compile_commands.json`
+  linked from outside the project, so the startup fails as if it were missing.
 - Build the editor target once before generating, so the `*.generated.h` headers exist.
   After a build you can add `-NoExecCodeGenActions` to skip redundant codegen.
 
@@ -93,8 +97,9 @@ safe to delete afterwards. Use Route 1.
 
 Regenerate only when you add a module or change a `*.Build.cs` (new files or compiler
 flags). clangd watches `compile_commands.json` and reloads automatically, so routine edits
-need no regeneration. If Serena failed to start because the database was missing or empty,
-reconnect or restart the MCP after creating it. Serena reads the database only at startup.
+need no regeneration. If Serena failed to start because the database was missing or empty
+(or, in untrusted or routed worktree projects, linked from outside the project, which counts as
+missing), reconnect or restart the MCP after creating it. Serena reads the database only at startup.
 
 ---
 ## Build artifact directories

@@ -11,7 +11,7 @@ from typing import Any
 
 from overrides import override
 
-from solidlsp.ls import RawDocumentSymbol, SolidLanguageServer
+from solidlsp.ls import FixedPathFile, RawDocumentSymbol, SolidLanguageServer
 from solidlsp.ls_config import LanguageServerConfig, LanguageServerId
 from solidlsp.ls_utils import FileUtils, PlatformId, PlatformUtils
 from solidlsp.lsp_protocol_handler.server import ProcessLaunchInfo
@@ -259,31 +259,36 @@ class ElixirTools(SolidLanguageServer):
     def _normalize_symbol_name(self, symbol: RawDocumentSymbol, relative_file_path: str) -> str:
         return symbol["name"].removeprefix("defp ").removeprefix("def ").split("(", 1)[0].strip()
 
-    def _find_mix_exs(self) -> str | None:
+    def _find_mix_exs(self) -> FixedPathFile | None:
         """
         Find mix.exs in the repository.
 
         Checks {repository_root_path}/mix.exs first (standard layout), then scans
         immediate subdirectories for mix.exs (monorepo layout, e.g. server/mix.exs).
-        Returns the absolute path to the first match found, or None if not found.
+        Returns the first match found (its absolute path, and the path to read it from), or None if not found.
+        A mix.exs that is not a regular file, or that resolves out of the repository through a symbolic link (the file
+        itself or its subdirectory), is not considered unless, for the latter, the configuration follows links, since its
+        content is sent to the server.
 
         Note: subdirectory iteration order depends on the filesystem (os.listdir).
         In practice this is fine — monorepos typically have one Elixir app.
         """
         # Check root first
-        root_mix_exs = os.path.join(self.repository_root_path, "mix.exs")
-        if os.path.exists(root_mix_exs):
-            return root_mix_exs
+        if os.path.exists(os.path.join(self.repository_root_path, "mix.exs")):
+            root_mix_exs = self._resolve_readable_fixed_path_file("mix.exs")
+            if root_mix_exs is not None:
+                return root_mix_exs
 
         # Search immediate subdirectories
         try:
             for entry in os.listdir(self.repository_root_path):
                 subdir_path = os.path.join(self.repository_root_path, entry)
                 if os.path.isdir(subdir_path):
-                    subdir_mix_exs = os.path.join(subdir_path, "mix.exs")
-                    if os.path.exists(subdir_mix_exs):
-                        log.info(f"Found mix.exs in subdirectory: {entry}/mix.exs")
-                        return subdir_mix_exs
+                    if os.path.exists(os.path.join(subdir_path, "mix.exs")):
+                        subdir_mix_exs = self._resolve_readable_fixed_path_file(os.path.join(entry, "mix.exs"))
+                        if subdir_mix_exs is not None:
+                            log.info(f"Found mix.exs in subdirectory: {entry}/mix.exs")
+                            return subdir_mix_exs
         except OSError as e:
             log.warning(f"Error scanning for mix.exs in subdirectories: {e}")
 
@@ -420,12 +425,12 @@ class ElixirTools(SolidLanguageServer):
         # Without it Expert sits idle and never emits the $/progress signals we wait for,
         # causing a deadlock. Opening mix.exs is the minimal trigger; we close it again
         # once the server is ready so it does not linger in the open-file set.
-        mix_exs_path = self._find_mix_exs()
+        mix_exs = self._find_mix_exs()
         mix_exs_uri: str | None = None
 
-        if mix_exs_path is not None:
-            mix_exs_uri = pathlib.Path(mix_exs_path).as_uri()
-            with open(mix_exs_path, encoding="utf-8") as f:
+        if mix_exs is not None:
+            mix_exs_uri = pathlib.Path(mix_exs.path).as_uri()
+            with open(mix_exs.real_path, encoding="utf-8") as f:
                 mix_exs_content = f.read()
             self.server.notify.did_open_text_document(
                 {

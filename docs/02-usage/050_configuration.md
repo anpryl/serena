@@ -519,7 +519,7 @@ Supported settings:
 | Setting | Default | Description |
 |---|---|---|
 | `ls_path` | managed download | Override the `clangd` executable path. |
-| `compile_commands_dir` | `.serena` | Directory where Serena writes a transformed `compile_commands.json` if the project's original database uses relative `directory` entries. |
+| `compile_commands_dir` | `.serena` | Directory where Serena writes a transformed `compile_commands.json` if the project's original database uses relative `directory` entries (in untrusted or routed worktree projects, a database linked from outside the project is ignored, and clangd runs without one; an Unreal Engine project fails to start instead). |
 | `clangd_version` | `19.1.2` | Override the `clangd` version Serena downloads when `ls_path` is not set. |
 
 Serena starts `clangd` with `--limit-references=0` (all references) and `--log=error` (errors only; omitted when Serena itself logs at debug level).

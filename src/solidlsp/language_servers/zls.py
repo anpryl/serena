@@ -11,7 +11,7 @@ import shutil
 
 from overrides import override
 
-from solidlsp.ls import SolidLanguageServer
+from solidlsp.ls import FixedPathFile, SolidLanguageServer
 from solidlsp.ls_config import LanguageServerConfig
 from solidlsp.lsp_protocol_handler.server import ProcessLaunchInfo
 from solidlsp.settings import SolidLSPSettings
@@ -169,6 +169,16 @@ class ZigLanguageServer(SolidLanguageServer):
         }
         return initialize_params
 
+    def _find_build_zig(self) -> FixedPathFile | None:
+        """
+        :return: the repository's build.zig, whose content is sent to the server at startup, or None if there is none, it
+            is not a regular file, or it resolves out of the repository through a symbolic link that the configuration
+            does not follow
+        """
+        if not os.path.exists(os.path.join(self.repository_root_path, "build.zig")):
+            return None
+        return self._resolve_readable_fixed_path_file("build.zig")
+
     def _start_server(self) -> None:
         """Start ZLS server process"""
 
@@ -204,13 +214,13 @@ class ZigLanguageServer(SolidLanguageServer):
         # ZLS server is ready after initialization
         # (no need to wait for an event)
 
-        # Open build.zig if it exists to help ZLS understand project structure
-        build_zig_path = os.path.join(self.repository_root_path, "build.zig")
-        if os.path.exists(build_zig_path):
+        # Open build.zig, if there is one that may be read (see _find_build_zig), to help ZLS understand project structure
+        build_zig = self._find_build_zig()
+        if build_zig is not None:
             try:
-                with open(build_zig_path, encoding="utf-8") as f:
+                with open(build_zig.real_path, encoding="utf-8") as f:
                     content = f.read()
-                    uri = pathlib.Path(build_zig_path).as_uri()
+                    uri = pathlib.Path(build_zig.path).as_uri()
                     self.server.notify.did_open_text_document(
                         {
                             "textDocument": {

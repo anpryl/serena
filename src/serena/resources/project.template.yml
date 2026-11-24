@@ -100,6 +100,8 @@ ls_workspace_folders: ["."]
 # Each folder is registered as an LSP workspace folder, enabling language servers to discover
 # symbols and references across package boundaries, but these folders are not indexed by Serena,
 # i.e. the respective symbols will not be found using Serena's symbol search tools.
+# In untrusted projects (and the projects of routed git worktrees), a folder reached through a symbolic link
+# inside the project root that leads out of it is skipped.
 # Example:
 #   additional_workspace_folders:
 #     - ../sibling-package

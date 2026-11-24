@@ -317,9 +317,15 @@ class AstroLanguageServer(SolidLanguageServer):
         return os.path.join(self._get_install_dir(), "node_modules", "@astrojs", "ts-plugin")
 
     def _find_all_astro_files(self) -> list[str]:
+        """
+        :return: relative paths of all .astro files in the repo (excluding node_modules and dot-dirs, and files reached
+            through a symbolic link unless the configuration follows links)
+        """
         astro_files = []
         repo = pathlib.Path(self.repo_path)
         for astro_file in repo.rglob("*.astro"):
+            if self._is_reached_through_unfollowed_link(astro_file):
+                continue
             try:
                 relative = str(astro_file.relative_to(repo))
                 if "node_modules" not in relative and not relative.startswith("."):
@@ -401,9 +407,11 @@ class AstroLanguageServer(SolidLanguageServer):
 
     def _start_typescript_server(self) -> None:
         try:
+            # the companion serves the same repository, so it keeps this server's symlink rule
             ts_config = LanguageServerConfig(
                 ls_id=LanguageServerId.TYPESCRIPT,
                 trace_lsp_communication=False,
+                follow_symlinks=self.config.is_following_symlinks(),
             )
             log.info("Creating companion AstroTypeScriptServer")
             self._ts_server = AstroTypeScriptServer(

@@ -100,6 +100,7 @@ class Project(ToStringMixin):
         is_newly_created: bool = False,
         absolute_output_paths: bool = False,
         write_guard: WriteGuard | None = None,
+        untrusted_symlink_rules: bool = False,
     ):
         """
         :param project_root: path to the project's root folder; it is assumed to be fully resolved
@@ -109,9 +110,12 @@ class Project(ToStringMixin):
         :param absolute_output_paths: whether results name the project's files by absolute path (see :attr:`output_paths`)
             instead of relative to the project root
         :param write_guard: the check to apply before each write to the project's files (see :meth:`check_write`), if any
+        :param untrusted_symlink_rules: whether Serena's untrusted symlink rules apply even if the project is trusted
+            (see :meth:`are_symlinks_trusted`)
         """
         assert serena_config is not None
         self._write_guard = write_guard
+        self._untrusted_symlink_rules = untrusted_symlink_rules
         self.project_root = project_root
         self.output_paths = OutputPaths(absolute_root=project_root if absolute_output_paths else None)
         """the paths by which results name the project's files"""
@@ -367,6 +371,19 @@ class Project(ToStringMixin):
         """
         return self.serena_config.is_trusted_project_path(self.project_root)
 
+    def are_symlinks_trusted(self) -> bool:
+        """
+        Checks whether Serena's trusted symlink rules apply to the project, under which links are followed when walking
+        the project's subtrees and a requested path may resolve through a link to a location outside the project root.
+        Under the untrusted rules, links are neither followed nor contained when walking, and a requested path that
+        resolves outside the project root is rejected.
+        The symlink rules are decided by this predicate alone; the project's other trust-dependent features are decided
+        by :meth:`is_trusted`.
+
+        :return: True if the project is trusted and was not created with untrusted symlink rules, False otherwise
+        """
+        return self.is_trusted() and not self._untrusted_symlink_rules
+
     def read_file(self, relative_path: str) -> str:
         """
         Reads a project file.
@@ -483,8 +500,8 @@ class Project(ToStringMixin):
         Scans the directory at the given path, returning the directories and files it contains
         as paths relative to the project root.
 
-        In an untrusted project, symbolic links are ignored entirely: they are neither followed nor
-        contained in the result, so that a link cannot lead the scan outside of the project root.
+        Under the untrusted symlink rules (see :meth:`are_symlinks_trusted`), symbolic links are ignored entirely: they
+        are neither followed nor contained in the result, so that a link cannot lead the scan outside of the project root.
 
         :param relative_path: the path of the directory to scan, relative to the project root
         :param recursive: whether to scan subdirectories recursively
@@ -498,7 +515,7 @@ class Project(ToStringMixin):
         if not self.is_path_in_project(abs_path):
             raise ValueError(f"Path {self.output_paths.of(relative_path)} points outside the project root ({self.project_root})")
 
-        follow_links = self.is_trusted()
+        follow_links = self.are_symlinks_trusted()
 
         # ignore rules can only be applied if the start path is not itself ignored
         # (if it is, we return everything below it, since the caller explicitly requested it)
@@ -540,13 +557,13 @@ class Project(ToStringMixin):
     def _is_symlink_escaping_project_trust_boundary(self, path: str | Path) -> bool:
         """
         Checks whether the given path escapes the project's trust boundary through a symlink.
-        An untrusted project cannot contain symlinks that point outside of the project root,
-        whereas it is allowed for trusted projects.
+        Under the untrusted symlink rules (see :meth:`are_symlinks_trusted`), a project cannot contain symlinks that point
+        outside of the project root, whereas the trusted rules allow it.
 
         :param path: the path to check, absolute or relative to the project root
         :return: whether the path escapes the trust boundary
         """
-        if self.is_trusted():
+        if self.are_symlinks_trusted():
             return False
 
         if not os.path.isabs(path):
@@ -562,7 +579,7 @@ class Project(ToStringMixin):
             escapes = True
 
         if escapes:
-            log.debug(f"Path {path} resolves outside the project root {self.project_root} and the project is not trusted")
+            log.debug(f"Path {path} resolves outside the project root {self.project_root} under the untrusted symlink rules")
         return escapes
 
     def is_path_in_project(self, path: str | Path) -> bool:
@@ -570,8 +587,8 @@ class Project(ToStringMixin):
         Checks if the given (absolute or relative) path is within the project's trust boundary.
 
         Containment is decided based on the lexically normalized path, which catches ".." segments, and,
-        for untrusted projects, the path with symlinks resolved (symlinks that point outside the project root
-        are only allowed in trusted projects).
+        under the untrusted symlink rules (see :meth:`are_symlinks_trusted`), the path with symlinks resolved
+        (symlinks that point outside the project root are only allowed under the trusted rules).
         """
         if not os.path.isabs(path):
             path = os.path.join(self.project_root, path)
@@ -659,8 +676,9 @@ class Project(ToStringMixin):
         """
         Retrieves all (non-ignored) project files, optionally limited to the given path
 
-        In an untrusted project, symbolic links are ignored entirely: they are neither followed nor
-        contained in the result, so that a link cannot lead the discovery outside of the project root.
+        Under the untrusted symlink rules (see :meth:`are_symlinks_trusted`), symbolic links are ignored entirely: they
+        are neither followed nor contained in the result, so that a link cannot lead the discovery outside of the project
+        root.
 
         :param relative_path: if provided, restrict search to this path
         :param code_files_only: whether to ignore files that are not source files.
@@ -673,9 +691,9 @@ class Project(ToStringMixin):
         if not os.path.exists(start_path):
             raise FileNotFoundError(f"Root directory {start_path} not found.")
 
-        # in an untrusted project, links are not part of the project's file set, since they may
+        # under the untrusted symlink rules, links are not part of the project's file set, since they may
         # point outside of the project root
-        follow_links = self.is_trusted()
+        follow_links = self.are_symlinks_trusted()
 
         if os.path.isfile(start_path):
             if not self.is_ignored_path(start_path, ignore_non_source_files=code_files_only, is_file=True):
@@ -869,6 +887,7 @@ class Project(ToStringMixin):
                 ls_specific_settings=ls_specific_settings,
                 trace_lsp_communication=self.serena_config.trace_lsp_communication,
                 is_project_trusted=is_trusted,
+                follow_symlinks=self.are_symlinks_trusted(),
                 write_guard=self._write_guard,
             )
             self.language_server_manager = LanguageServerManager.from_languages(self.project_config.language_servers, factory, self)

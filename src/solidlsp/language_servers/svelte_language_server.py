@@ -326,10 +326,15 @@ class SvelteLanguageServer(SolidLanguageServer):
         return os.path.join(self._get_install_dir(), "node_modules", "typescript-svelte-plugin")
 
     def _find_all_svelte_files(self) -> list[str]:
-        """:return: relative paths of all .svelte files in the repo (excluding node_modules and dot-dirs)."""
+        """
+        :return: relative paths of all .svelte files in the repo (excluding node_modules and dot-dirs, and files reached
+            through a symbolic link unless the configuration follows links)
+        """
         svelte_files = []
         repo = pathlib.Path(self.repo_path)
         for svelte_file in repo.rglob("*.svelte"):
+            if self._is_reached_through_unfollowed_link(svelte_file):
+                continue
             try:
                 relative = str(svelte_file.relative_to(repo))
                 if "node_modules" not in relative and not relative.startswith("."):
@@ -419,9 +424,11 @@ class SvelteLanguageServer(SolidLanguageServer):
     def _start_typescript_server(self) -> None:
         """Spawn the companion :class:`SvelteTypeScriptServer`, wait for ready, then index .svelte files."""
         try:
+            # the companion serves the same repository, so it keeps this server's symlink rule
             ts_config = LanguageServerConfig(
                 ls_id=LanguageServerId.TYPESCRIPT,
                 trace_lsp_communication=False,
+                follow_symlinks=self.config.is_following_symlinks(),
             )
             log.info("Creating companion SvelteTypeScriptServer")
             self._ts_server = SvelteTypeScriptServer(

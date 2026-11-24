@@ -157,7 +157,8 @@ class ClojureLSP(SolidLanguageServer):
         otherwise have to write manually in ``.lsp/config.edn``.
 
         :return: deduplicated, repo-root-relative, forward-slash-normalised source paths from
-            every project descriptor found in the tree (pruning via :py:meth:`is_ignored_dirname`);
+            every project descriptor found in the tree (pruning via :py:meth:`is_ignored_dirname`, and leaving out
+            descriptors reached through a symbolic link unless the configuration follows links);
             falls back to ``["src"]`` if nothing is discovered, matching the clojure-lsp default
         """
         repository_absolute_path = self.repository_root_path
@@ -171,7 +172,10 @@ class ClojureLSP(SolidLanguageServer):
             module_rel = os.path.relpath(dirpath, repository_absolute_path)
             for descriptor in self._PROJECT_DESCRIPTOR_FILENAMES:
                 if descriptor in filenames:
-                    for declared_path in self._parse_project_descriptor_paths(os.path.join(dirpath, descriptor)):
+                    descriptor_path = os.path.join(dirpath, descriptor)
+                    if self._is_reached_through_unfollowed_link(descriptor_path):
+                        continue
+                    for declared_path in self._parse_project_descriptor_paths(descriptor_path):
                         if module_rel == ".":
                             resolved = declared_path
                         else:

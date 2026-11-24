@@ -598,7 +598,21 @@ class TypeScriptLanguageServer(SolidLanguageServer):
         (vitest.config.ts, jest.config.ts, etc.) is not picked over the project's real
         source tree. Falls back to a file directly adjacent to tsconfig.json, then to
         the first .ts/.tsx file found anywhere in the directory.
+        Inside the repository, files reached through a symbolic link are left out unless the configuration follows links.
         """
+        # the file found is opened on the server, so inside the repository it must not be reached through a link that is
+        # not to be followed; an additional workspace folder may lie outside the repository by design
+        try:
+            is_in_repository = os.path.commonpath([os.path.abspath(directory), self.repository_root_path]) == self.repository_root_path
+        except ValueError:
+            is_in_repository = False
+
+        def is_seed(path: str) -> bool:
+            name = os.path.basename(path)
+            if not name.endswith((".ts", ".tsx")) or name.endswith(".d.ts"):
+                return False
+            return not (is_in_repository and self._is_reached_through_unfollowed_link(path))
+
         for root, dirs, files in os.walk(directory):
             dirs[:] = [d for d in dirs if not self.is_ignored_dirname(d)]
             if "tsconfig.json" in files:
@@ -607,16 +621,16 @@ class TypeScriptLanguageServer(SolidLanguageServer):
                     for src_root, src_dirs, src_files in os.walk(src_dir):
                         src_dirs[:] = [d for d in src_dirs if not self.is_ignored_dirname(d)]
                         for f in src_files:
-                            if f.endswith((".ts", ".tsx")) and not f.endswith(".d.ts"):
+                            if is_seed(os.path.join(src_root, f)):
                                 return os.path.join(src_root, f)
                 for f in files:
-                    if f.endswith((".ts", ".tsx")) and not f.endswith(".d.ts"):
+                    if is_seed(os.path.join(root, f)):
                         return os.path.join(root, f)
 
         for root, dirs, files in os.walk(directory):
             dirs[:] = [d for d in dirs if not self.is_ignored_dirname(d)]
             for f in files:
-                if f.endswith((".ts", ".tsx")) and not f.endswith(".d.ts"):
+                if is_seed(os.path.join(root, f)):
                     return os.path.join(root, f)
         return None
 

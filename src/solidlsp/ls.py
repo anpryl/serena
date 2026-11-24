@@ -34,7 +34,7 @@ from solidlsp.dependency_provider import (
     LanguageServerDependencyProviderUvx,
 )
 from solidlsp.initialize_params import DefaultInitializeParamsBuilder, InitializeParamsBuilder
-from solidlsp.ls_config import FilenameMatcher, LanguageServerConfig
+from solidlsp.ls_config import FilenameMatcher, LanguageServerConfig, RealRoot
 from solidlsp.ls_exceptions import InvalidTextLocationError, SolidLSPException
 from solidlsp.ls_process import DEFAULT_LS_REQUEST_TIMEOUT, LanguageServerInterface, StdioLanguageServer
 from solidlsp.ls_types import UnifiedSymbolInformation
@@ -350,6 +350,19 @@ class DocumentSymbols:
         return self._all_symbols, self.root_symbols
 
 
+@dataclass(frozen=True)
+class FixedPathFile:
+    """
+    A file a language server looks up at a fixed path, as resolved for reading it.
+    """
+
+    path: str
+    """the file's path as named (e.g. for its URI)"""
+    real_path: str
+    """the path to read the file from: the real path that was validated where symbolic links are not followed (so that a
+    link swapped after the validation is not followed), the named path otherwise"""
+
+
 class SolidLanguageServer(ABC):
     """
     High-level abstraction for language server interaction, which wraps the underlying low-level LSP interface
@@ -413,6 +426,65 @@ class SolidLanguageServer(ABC):
         in Python and node_modules in JS/TS should be ignored always.
         """
         return dirname in self._ALWAYS_IGNORED_DIRS
+
+    def _resolve_fixed_path_file(self, path: str | Path) -> "FixedPathFile | None":
+        """
+        Resolves a file the server looks up at a fixed path (rather than by a walk), leaving it out if it resolves out of
+        the repository through a symbolic link and the configuration does not follow links (see
+        :meth:`LanguageServerConfig.is_following_symlinks`). A link that stays inside the repository does not count.
+
+        :param path: the path, absolute or relative to the repository root
+        :return: the file, or None if it is to be left out
+        """
+        named_path = os.path.join(self.repository_root_path, path)
+        if self.config.is_following_symlinks():
+            return FixedPathFile(path=named_path, real_path=named_path)
+        real_path = os.path.realpath(named_path)
+        if not RealRoot(self.repository_root_path).contains(real_path):
+            return None
+        return FixedPathFile(path=named_path, real_path=real_path)
+
+    def _resolve_readable_fixed_path_file(self, path: str | Path) -> "FixedPathFile | None":
+        """
+        Resolves a file the server looks up at a fixed path and reads, as :meth:`_resolve_fixed_path_file` does, also
+        leaving it out (logged) if it is not a regular file, e.g. a FIFO, whose read would block.
+
+        :param path: the path, absolute or relative to the repository root
+        :return: the file, or None if it is to be left out
+        """
+        found = self._resolve_fixed_path_file(path)
+        if found is not None and not os.path.isfile(found.real_path):
+            log.warning("%s is not a regular file; treating it as absent", found.path)
+            return None
+        return found
+
+    def _is_reached_through_unfollowed_link(self, path: str | Path, start: str | Path | None = None) -> bool:
+        """
+        Checks whether a path found by a server's own walk of the repository's files is to be left out of it because of a
+        symbolic link: the path itself, or a directory on the way to it from the walk's start, is a link, and the
+        configuration does not follow links (see :meth:`LanguageServerConfig.is_following_symlinks`).
+
+        :param path: the path, absolute or relative to the repository root
+        :param start: the directory the walk started from, absolute or relative to the repository root, if not the root;
+            its own path is not checked, since it was requested explicitly and may, like any requested path, pass through
+            a link that stays inside the repository
+        :return: whether the path is to be left out; a path outside the walk's start is left out unless links are followed
+        """
+        if self.config.is_following_symlinks():
+            return False
+
+        root = Path(self.repository_root_path)
+        start_path = root if start is None else root / start
+        try:
+            relative_parts = (root / path).relative_to(start_path).parts
+        except ValueError:
+            return True
+        current = start_path
+        for part in relative_parts:
+            current = current / part
+            if current.is_symlink():
+                return True
+        return False
 
     @staticmethod
     def _determine_log_level(line: str) -> int:
@@ -2221,7 +2293,8 @@ class SolidLanguageServer(ABC):
         All symbols except the root packages will have a parent attribute.
         Will ignore directories starting with '.', language-specific defaults
         and user-configured directories (e.g. from .gitignore).
-        Ignore rules apply to unresolved paths. Discovered symbolic links are followed only in trusted projects.
+        Ignore rules apply to unresolved paths. Discovered symbolic links are followed only where the configuration
+        says so (see :meth:`LanguageServerConfig.is_following_symlinks`).
 
         :param within_relative_path: pass a relative path to only consider symbols within this path.
             If a file is passed, only the symbols within this file will be considered.
@@ -2261,8 +2334,8 @@ class SolidLanguageServer(ABC):
             result.append(package_symbol)
 
             for contained_dir_or_file_entry in contained_dir_or_file_entries:
-                # skip symbolic links during discovery in untrusted projects
-                if not self.config.is_project_trusted and contained_dir_or_file_entry.is_symlink():
+                # skip symbolic links during discovery in untrusted projects, and wherever they are not to be followed
+                if not self.config.is_following_symlinks() and contained_dir_or_file_entry.is_symlink():
                     continue
 
                 contained_dir_or_file_name = contained_dir_or_file_entry.name

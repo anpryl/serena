@@ -683,11 +683,21 @@ class AngularLanguageServer(SolidLanguageServer):
         deliberately looser than the TypeScript sibling, which picks a file adjacent to the tsconfig:
         ngserver resolves the owning project from the file itself, and in a monorepo the seed and the
         tsconfig that covers it routinely live in different directories.
+
+        Inside the repository, files reached through a symbolic link are left out unless the configuration follows links.
         """
         component: str | None = None
         fallback: str | None = None
         has_tsconfig = False
         scanned_dirs = 0
+
+        # the seed is opened on ngserver, so inside the repository it must not be reached through a link that is not to
+        # be followed; an additional workspace folder may lie outside the repository by design
+        try:
+            is_in_repository = os.path.commonpath([os.path.abspath(directory), self.repository_root_path]) == self.repository_root_path
+        except ValueError:
+            is_in_repository = False
+
         for dirpath, dirnames, filenames in os.walk(directory):
             # prune in place so a big node_modules is never descended into; sort so the seed is the
             # same file on every machine rather than whatever the filesystem happened to list first
@@ -697,6 +707,8 @@ class AngularLanguageServer(SolidLanguageServer):
                 if not name.endswith(".ts") or name.endswith((".d.ts", ".spec.ts")):
                     continue
                 path = os.path.join(dirpath, name)
+                if is_in_repository and self._is_reached_through_unfollowed_link(path):
+                    continue
                 if name.endswith(".component.ts"):
                     if component is None:
                         component = path

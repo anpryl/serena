@@ -1,9 +1,11 @@
 import logging
 import os
 import re
+import shlex
 import shutil
 import statistics
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -23,17 +25,22 @@ from serena.lsp.lsp_diagnostics import DiagnosticsContext
 from serena.project import Project
 from serena.tools import (
     CreateTextFileTool,
+    DeleteLinesTool,
     FindDeclarationTool,
     FindFileTool,
     FindReferencingSymbolsTool,
     FindSymbolTool,
     GetDiagnosticsForFileTool,
     GetSymbolsOverviewTool,
+    InsertAfterSymbolTool,
+    InsertAtLineTool,
+    InsertBeforeSymbolTool,
     ListDirTool,
     ReadFileTool,
     RenameSymbolTool,
     ReplaceContentTool,
     ReplaceInFilesTool,
+    ReplaceLinesTool,
     ReplaceSymbolBodyTool,
     SafeDeleteSymbol,
     SearchForPatternTool,
@@ -41,6 +48,7 @@ from serena.tools import (
 )
 from serena.tools.tools_base import EditingToolWithDiagnostics
 from serena.worktree_routing import WorktreeRouter
+from solidlsp.language_servers.pyright_server import PYRIGHT_VERSION
 from solidlsp.ls import SolidLanguageServer
 from solidlsp.ls_config import LanguageServerId
 from test.conftest import get_pytest_markers, get_repo_path
@@ -678,6 +686,123 @@ class TestWorktreeRouting:
         call(agent, ReplaceContentTool, relative_path=path, needle="class User(BaseModel):", repl="class Edited:", mode="literal")
         assert worktree_repo.read_models(sibling.root) == sibling_models_before
 
+    @pytest.mark.parametrize("link_kind", ["file", "directory"])
+    def test_symlink_into_main_checkout_is_neither_read_nor_written_through(self, worktree_repo: WorktreeRepo, link_kind: str) -> None:
+        """
+        A link from the worktree into the main checkout is never read or written through. A call naming a path through
+        the link is refused, naming the link; a walk of the worktree (root-wide symbol and pattern search, a root-wide
+        replacement) does not contain the link under the untrusted symlink rules, so it finds nothing there to read,
+        change or refuse.
+        """
+        sibling = worktree_repo.worktrees["sibling"]
+        main_only = worktree_repo.main / "test_repo" / "main_only.py"
+        main_only.write_text("def main_only_function() -> None:\n    pass\n", encoding="utf-8")
+        main_before = snapshot_files(worktree_repo.main)
+
+        # link from the (trusted) worktree into the main checkout, either to a file or to a directory
+        if link_kind == "file":
+            link = sibling.root / "test_repo" / "linked_main_only.py"
+            link.symlink_to(main_only)
+            path = str(link)
+        else:
+            link = sibling.root / "linked_main"
+            link.symlink_to(main_only.parent, target_is_directory=True)
+            path = str(link / "main_only.py")
+        root = str(sibling.root)
+        refusal = f"git worktree {sibling.root}: a symbolic link leads to"
+
+        line_edit_tools = ["delete_lines", "replace_lines", "insert_at_line"]
+        with routing_agent(worktree_repo.main, included_optional_tools=line_edit_tools) as agent:
+            # walks: nothing behind the link is found, and a root-wide replacement finds nothing there to change
+            assert call(agent, FindSymbolTool, name_path_pattern="main_only_function", relative_path=root) == "[]"
+            assert "main_only_function" not in call(agent, SearchForPatternTool, substring_pattern="main_only_function", relative_path=root)
+            assert "main_only.py" not in call(
+                agent, ReplaceInFilesTool, needle="main_only_function", repl="edited", mode="literal", relative_path=root
+            )
+
+            # reads and writes of a path through the link (the file behind it, or the link itself): each refused
+            symbol = "main_only_function"
+            body = "def main_only_function() -> None:\n    return None"
+            calls: list[tuple[type[Tool], dict[str, Any]]] = [
+                (ReadFileTool, {}),
+                (GetSymbolsOverviewTool, {}),
+                (FindSymbolTool, {"name_path_pattern": symbol}),
+                (FindReferencingSymbolsTool, {"name_path": symbol}),
+                (FindDeclarationTool, {"regex": f"def ({symbol})"}),
+                (GetDiagnosticsForFileTool, {}),
+                (SearchForPatternTool, {"substring_pattern": symbol}),
+                (SearchForPatternTool, {"substring_pattern": symbol, "relative_path": str(link)}),
+                (ListDirTool, {"recursive": True, "relative_path": str(link)}),
+                (FindFileTool, {"file_mask": "*.py", "relative_path": str(link)}),
+                (ReplaceContentTool, {"needle": symbol, "repl": "edited", "mode": "literal"}),
+                (ReplaceInFilesTool, {"needle": symbol, "repl": "edited", "mode": "literal"}),
+                (CreateTextFileTool, {"content": "overwritten\n"}),
+                (DeleteLinesTool, {"start_line": 0, "end_line": 0}),
+                (ReplaceLinesTool, {"start_line": 0, "end_line": 0, "content": "edited\n"}),
+                (InsertAtLineTool, {"line": 0, "content": "edited\n"}),
+                (ReplaceSymbolBodyTool, {"name_path": symbol, "body": body}),
+                (InsertAfterSymbolTool, {"name_path": symbol, "body": body}),
+                (InsertBeforeSymbolTool, {"name_path": symbol, "body": body}),
+                (RenameSymbolTool, {"name_path": symbol, "new_name": "edited"}),
+                (SafeDeleteSymbol, {"name_path_pattern": symbol}),
+            ]
+            for tool_class, kwargs in calls:
+                result = call(agent, tool_class, **{"relative_path": path, **kwargs})
+                assert refusal in result, (tool_class.__name__, result)
+                assert "main_only_function" not in result.replace(path, ""), (tool_class.__name__, result)
+
+        assert snapshot_files(worktree_repo.main) == main_before
+
+    def test_workspace_folder_reached_through_a_link_into_main_checkout_is_not_scanned(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo
+    ) -> None:
+        """
+        A workspace folder the worktree's configuration names through a link into the main checkout is not searched by a
+        root-wide find_symbol on the worktree, which finds the worktree's own symbols.
+        """
+        sibling = worktree_repo.worktrees["sibling"]
+        main_only = worktree_repo.main / "test_repo" / "main_only.py"
+        main_only.write_text("def main_only_function() -> None:\n    pass\n", encoding="utf-8")
+
+        # the worktree's configuration names a workspace folder that is a link into the main checkout
+        (sibling.root / "linked_main").symlink_to(main_only.parent, target_is_directory=True)
+        commit_worktree_config(sibling.root, ls_workspace_folders=[".", "linked_main"])
+
+        assert call(agent, FindSymbolTool, name_path_pattern="main_only_function", relative_path=str(sibling.root)) == "[]"
+        assert sibling.marker in call(agent, FindSymbolTool, name_path_pattern=sibling.marker, relative_path=str(sibling.root))
+
+    def test_symlink_staying_inside_worktree_follows_untrusted_rules(self, agent: SerenaAgent, worktree_repo: WorktreeRepo) -> None:
+        """
+        A symlink that stays inside the worktree is handled by Serena's untrusted symlink rules, though the worktree is
+        trusted: walks of the worktree (root-wide symbol and pattern search, directory listing) neither follow the link
+        nor list it, so the target's symbols are found under the target's own path only; a path through the link, given
+        explicitly, resolves inside the worktree and is therefore read and edited, the edit landing in the target.
+        """
+        sibling = worktree_repo.worktrees["sibling"]
+        target = sibling.root / "inner" / "inner_only.py"
+        target.parent.mkdir()
+        target.write_text("def inner_only_function() -> None:\n    pass\n", encoding="utf-8")
+        dir_link = sibling.root / "test_repo" / "inner_alias"
+        dir_link.symlink_to(target.parent, target_is_directory=True)
+        file_link = sibling.root / "test_repo" / "inner_alias_file.py"
+        file_link.symlink_to(target)
+        root = str(sibling.root)
+
+        # walks: found under the target's path, never under a link
+        for result in (
+            call(agent, FindSymbolTool, name_path_pattern="inner_only_function", relative_path=root),
+            call(agent, SearchForPatternTool, substring_pattern="inner_only_function", relative_path=root),
+        ):
+            assert str(target) in result
+            assert "inner_alias" not in result
+        assert "inner_alias" not in call(agent, ListDirTool, relative_path=root, recursive=True)
+
+        # explicit paths through the links: read and edited
+        assert "inner_only_function" in call(agent, ReadFileTool, relative_path=str(dir_link / "inner_only.py"))
+        call(agent, ReplaceContentTool, relative_path=str(file_link), needle="inner_only_function", repl="edited_function", mode="literal")
+        assert file_link.is_symlink()
+        assert "edited_function" in target.read_text(encoding="utf-8")
+
     @pytest.mark.parametrize("spelling", ["parent_segment", "symlink_to_root"])
     def test_path_resolving_into_read_only_nested_worktree_is_refused(
         self, agent: SerenaAgent, worktree_repo: WorktreeRepo, spelling: str
@@ -870,6 +995,31 @@ class TestWorktreeRouting:
             ls_specific_settings={"python": {"ls_path": str(worktree_repo.main / "no-such-language-server")}},
         ) as agent:
             assert sibling.marker in call(agent, GetSymbolsOverviewTool, relative_path=str(sibling.root / MODELS_FILE))
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the launcher is a POSIX shell script")
+    def test_worktree_language_server_is_launched_from_its_configured_ls_path(
+        self, agent: SerenaAgent, worktree_repo: WorktreeRepo, tmp_path: Path
+    ) -> None:
+        sibling = worktree_repo.worktrees["sibling"]
+
+        # a launcher that records its invocation, then runs the pinned pyright
+        uv = shutil.which("uv")
+        if uv is None:
+            pytest.skip("the launcher runs pyright through uv, which is not on PATH")
+        launches = tmp_path / "launches.log"
+        launcher = tmp_path / "bin" / "pyright-langserver"
+        launcher.parent.mkdir()
+        launcher.write_text(
+            "#!/bin/sh\n"
+            f'echo "$0" >> {shlex.quote(str(launches))}\n'
+            f'exec {shlex.quote(uv)} tool run -p 3.13 --from pyright=={PYRIGHT_VERSION} pyright-langserver "$@"\n',
+            encoding="utf-8",
+        )
+        launcher.chmod(0o755)
+        commit_worktree_config(sibling.root, ls_specific_settings={"python": {"ls_path": str(launcher)}})
+
+        assert sibling.marker in call(agent, GetSymbolsOverviewTool, relative_path=str(sibling.root / MODELS_FILE))
+        assert launches.read_text(encoding="utf-8").splitlines() == [str(launcher)]
 
     def test_nested_worktree_with_newline_in_path_is_refused_without_nul_listing(
         self, agent: SerenaAgent, worktree_repo: WorktreeRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -1180,6 +1180,51 @@ class LanguageServerRegistry:
         return sorted(self._registered_language_servers.keys())
 
 
+class RealRoot:
+    """
+    A repository root, recognised by identity (device and inode), so that any spelling of it (letter case, firmlinks)
+    counts as the root.
+    """
+
+    def __init__(self, root: str):
+        """
+        :param root: the root, in any spelling
+        """
+        self.path = os.path.realpath(root)
+        """the root's real path"""
+        # an inode number of 0 identifies nothing (some network, FUSE and Windows file systems report it for every
+        # entry), so such a root is recognised by the textual comparison only
+        try:
+            root_stat = os.stat(self.path)
+            self._id: tuple[int, int] | None = (root_stat.st_dev, root_stat.st_ino) if root_stat.st_ino != 0 else None
+        except OSError:
+            self._id = None
+
+    def contains(self, real_path: str) -> bool:
+        """
+        :param real_path: a real path (symbolic links resolved)
+        :return: whether the path is the root or lies inside it; ancestors that cannot be inspected, or report no inode
+            number (0), are skipped, and a textual comparison decides where no ancestor is the root
+        """
+        if self._id is not None:
+            candidate = real_path
+            while True:
+                try:
+                    candidate_stat = os.stat(candidate)
+                    if candidate_stat.st_ino != 0 and (candidate_stat.st_dev, candidate_stat.st_ino) == self._id:
+                        return True
+                except OSError:
+                    pass
+                parent = os.path.dirname(candidate)
+                if parent == candidate:
+                    break
+                candidate = parent
+        try:
+            return os.path.commonpath([real_path, self.path]) == self.path
+        except ValueError:
+            return False
+
+
 @dataclass(frozen=True)
 class LanguageServerConfig:
     """
@@ -1220,6 +1265,24 @@ class LanguageServerConfig:
     The default retains the historical behaviour; applications embedding SolidLSP are expected to pass the
     trust status they have determined for the project.
     """
+    follow_symlinks: bool = True
+    """
+    whether the discovery of the repository's files may follow symbolic links and include the files they lead to,
+    whether a configured workspace folder may be reached through a link that lies inside the repository and leads out
+    of it, and whether a file a server reads at a fixed path (e.g. a project manifest it opens at startup) may resolve
+    out of the repository through a link (see :meth:`is_following_symlinks`). It can only restrict what a trusted
+    repository's servers read, without affecting anything else its trust decides.
+    """
+
+    def is_following_symlinks(self) -> bool:
+        """
+        :return: whether the discovery of the repository's files (e.g. for the full symbol tree) follows symbolic links
+            and includes the files they lead to, whether a configured workspace folder (indexed or additional) may be
+            reached through a link that lies inside the repository and leads out of it, and whether a file a server reads
+            at a fixed path may resolve out of the repository through a link, which requires the repository to be trusted
+            (`is_project_trusted`) and `follow_symlinks` to be set
+        """
+        return self.is_project_trusted and self.follow_symlinks
 
     @classmethod
     def from_dict(cls, env: dict) -> Self:
@@ -1228,13 +1291,70 @@ class LanguageServerConfig:
         return cls(**{k: v for k, v in env.items() if k in inspect.signature(cls).parameters})
 
     @staticmethod
-    def _absolute_workspace_folders(folders: list[str], project_root: str) -> list[str]:
+    def _resolve_without_leaving_root_through_link(path: str, project_root: str) -> str | None:
+        """
+        Resolves the configured folder one component at a time, as the file system does, tracking the real directory
+        reached so far; validation and resolution are one pass, so the path returned is the one validated.
+
+        :param path: a configured folder, absolute or relative to the project root, as configured (unresolved)
+        :param project_root: the project root
+        :return: the folder's real path, or None if a component of the path does not exist or the path passes through a
+            symbolic link that lies inside the project root and leads out of it; a link lying outside the root (e.g. a
+            sibling folder named through a link) and a link leading back inside the root do not count
+        """
+        root = RealRoot(project_root)
+        real_root = root.path
+        is_inside_root = root.contains
+
+        configured = Path(path)
+        if configured.is_absolute():
+            current = os.path.realpath(configured.anchor)
+            parts = configured.parts[1:]
+        else:
+            current = real_root
+            parts = configured.parts
+        for part in parts:
+            if part in ("", "."):
+                continue
+            if part == "..":
+                current = os.path.dirname(current)
+                continue
+            joined = os.path.join(current, part)
+            if os.path.islink(joined):
+                target = os.path.realpath(joined)
+                if is_inside_root(current) and not is_inside_root(target):
+                    return None
+                current = target
+            elif os.path.exists(joined):
+                # real already (a real directory joined with an entry just seen not to be a link), so it is taken as the
+                # walk checked it; an entry swapped for a link after this check is still followed by every later use of the
+                # path returned (the stated check-then-use window, W7)
+                current = joined
+            else:
+                # every later step would pass through an entry nobody checked, and the folder does not exist anyway
+                return None
+        return current
+
+    def _absolute_workspace_folders(self, folders: list[str], project_root: str) -> list[str]:
         abs_workspace_folders = []
         for path in folders:
-            if os.path.isabs(path):
-                abs_path = str(Path(path).resolve())
+            if self.is_following_symlinks():
+                if os.path.isabs(path):
+                    abs_path = str(Path(path).resolve())
+                else:
+                    abs_path = os.path.realpath(os.path.join(project_root, path))
             else:
-                abs_path = os.path.realpath(os.path.join(project_root, path))
+                # a folder reached through a link that lies inside the project root and leads out of it is left out like
+                # any link not to be followed; the folder used is the path validated, never a second resolution
+                validated_path = self._resolve_without_leaving_root_through_link(path, project_root)
+                if validated_path is None:
+                    log.warning(
+                        "Workspace folder %s does not exist or is reached through a symbolic link out of the project root, which is not "
+                        "followed; skipping",
+                        path,
+                    )
+                    continue
+                abs_path = validated_path
             if not os.path.exists(abs_path):
                 log.error("Workspace folder does not exist: %s; skipping", abs_path)
                 continue
@@ -1247,6 +1367,8 @@ class LanguageServerConfig:
     def get_absolute_workspace_folders(self, project_root: str) -> list[str]:
         """
         Get the absolute paths of the workspace folders, resolving relative paths against the project root.
+        Where symbolic links are not followed (see :meth:`is_following_symlinks`), a folder reached through a link that
+        lies inside the project root and leads out of it is left out.
 
         :param project_root: The root path of the project
         :return: List of absolute workspace folder paths
@@ -1256,6 +1378,8 @@ class LanguageServerConfig:
     def get_absolute_additional_workspace_folders(self, project_root: str) -> list[str]:
         """
         Get the absolute paths of the additional workspace folders, resolving relative paths against the project root.
+        Where symbolic links are not followed (see :meth:`is_following_symlinks`), a folder reached through a link that
+        lies inside the project root and leads out of it is left out.
 
         :param project_root: The root path of the project
         :return: List of absolute additional workspace folder paths

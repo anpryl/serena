@@ -1485,6 +1485,7 @@ class WorktreeRouter:
             serena_config=self._agent.serena_config,
             absolute_output_paths=True,
             write_guard=write_guard,
+            untrusted_symlink_rules=True,
         )
         if os.path.realpath(project.path_to_serena_data_folder()) != real_data_folder:
             # refuse before any language server is started (none has been yet, so nothing is left running)

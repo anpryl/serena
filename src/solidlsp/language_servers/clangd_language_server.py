@@ -4,7 +4,10 @@ import hashlib
 import json
 import logging
 import os
+import shutil
+import tempfile
 import threading
+import weakref
 from collections.abc import Hashable
 from typing import Any
 
@@ -23,6 +26,13 @@ log = logging.getLogger(__name__)
 CLANGD_ALLOWED_HOSTS = ("github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com")
 
 
+def _remove_temporary_directory(path: str) -> None:
+    try:
+        shutil.rmtree(path)
+    except OSError as e:
+        log.warning("Failed to remove the temporary directory %s: %s", path, e)
+
+
 class ClangdLanguageServer(SolidLanguageServer):
     """
     Provides C/C++ specific instantiation of the LanguageServer class. Contains various configurations and settings specific to C/C++.
@@ -31,7 +41,9 @@ class ClangdLanguageServer(SolidLanguageServer):
 
     You can pass the following entries in ``ls_specific_settings["cpp"]``:
         - compile_commands_dir: Directory where Serena writes its transformed
-          ``compile_commands.json`` if needed.
+          ``compile_commands.json`` if needed. (Where a ``compile_commands.json`` linked from outside the repository is
+          ignored, clangd is instead pointed at an empty temporary directory, except in an Unreal Engine project, which
+          fails to start as with a missing database.)
         - clangd_version: Override the pinned Clangd version downloaded by Serena
           (default: the bundled Serena version).
     """
@@ -91,14 +103,34 @@ class ClangdLanguageServer(SolidLanguageServer):
             self._compile_commands_fingerprint(),
         )
 
-    def _compile_commands_fingerprint(self) -> str | None:
-        compile_db_path = os.path.join(self.repository_root_path, "compile_commands.json")
-        if not os.path.exists(compile_db_path):
-            return None
+    _FINGERPRINT_CHUNK_BYTES = 1024 * 1024
+    """the size of the chunks in which compile_commands.json is read for its fingerprint"""
 
+    _ignored_compile_commands_dir: str | None = None
+    """the empty temporary directory clangd is pointed at while the repository's database is ignored, if any"""
+
+    _ignored_compile_commands_dir_cleanup: weakref.finalize | None = None
+    """the removal of :attr:`_ignored_compile_commands_dir`, run once: when the server is stopped (running or not), when
+    the instance is garbage-collected, or at interpreter exit"""
+
+    def _compile_commands_fingerprint(self) -> str | None:
+        # lexists: a dangling link out of the repository is ignored, not taken for an absent database
+        if not os.path.lexists(os.path.join(self.repository_root_path, "compile_commands.json")):
+            return None
+        compile_db = self._resolve_fixed_path_file("compile_commands.json")
+        if compile_db is None:
+            # the database is ignored (see _prepare_compile_commands), so it is not read either
+            return "ignored"
+
+        # only a regular file is read (a FIFO or device would block or never end), in chunks of bounded size
         try:
-            with open(compile_db_path, "rb") as f:
-                return hashlib.md5(f.read()).hexdigest()
+            if not os.path.isfile(compile_db.real_path):
+                return None
+            digest = hashlib.md5()
+            with open(compile_db.real_path, "rb") as f:
+                for chunk in iter(lambda: f.read(self._FINGERPRINT_CHUNK_BYTES), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
         except OSError as e:
             log.warning(f"Failed to fingerprint compile_commands.json: {e}")
             return None
@@ -146,18 +178,39 @@ class ClangdLanguageServer(SolidLanguageServer):
         on cleanup. This allows clangd to use the absolute-path version without
         modifying the user's original compile_commands.json.
 
-        Returns the path to the serena directory containing the transformed database,
-        or None if no transformation was needed.
+        Returns the path to the serena directory containing the transformed database, or None if no transformation was
+        needed. A database that resolves out of the repository through a symbolic link that the configuration does not
+        follow (a dangling link included) is ignored: it is neither parsed nor rewritten; an Unreal Engine project then
+        fails as with a missing database, and otherwise the directory returned is an empty temporary one outside the
+        repository, so that clangd does not fall back to the linked database in the repository root. A database that is
+        not a regular file (e.g. a FIFO, or a dangling link inside the repository) is treated as absent.
         """
         compile_db_path = os.path.join(self.repository_root_path, "compile_commands.json")
 
-        if not os.path.exists(compile_db_path):
+        # lexists: a dangling link out of the repository is ignored below, not taken for an absent database (clangd would
+        # otherwise search the repository root itself and follow the link once its target appears)
+        if not os.path.lexists(compile_db_path):
             # clangd can't resolve UE engine headers without the database; fail with guidance.
             self._raise_if_unreal_without_compile_db()
             return None
 
+        compile_db = self._resolve_fixed_path_file("compile_commands.json")
+        if compile_db is None:
+            log.warning(
+                "compile_commands.json is linked from outside the repository, which is not followed; ignoring it, so clangd "
+                "runs without a compilation database"
+            )
+            # an Unreal Engine project cannot work without its database, exactly as when it is missing
+            self._raise_if_unreal_without_compile_db()
+            return self._prepare_ignored_compile_commands_dir()
+
+        if not os.path.isfile(compile_db.real_path):
+            log.warning("compile_commands.json is not a regular file; treating it as absent")
+            self._raise_if_unreal_without_compile_db()
+            return None
+
         try:
-            with open(compile_db_path, encoding="utf-8") as f:
+            with open(compile_db.real_path, encoding="utf-8") as f:
                 compile_commands = json.load(f)
 
             if not compile_commands:
@@ -203,9 +256,34 @@ class ClangdLanguageServer(SolidLanguageServer):
             log.warning(f"Failed to prepare compile_commands.json: {e}")
             return None
 
+    def _prepare_ignored_compile_commands_dir(self) -> str:
+        """
+        :return: a fresh empty temporary directory, outside the repository, for clangd's --compile-commands-dir while the
+            repository's database is ignored (replacing an earlier one); it is removed, best effort, when the server is
+            stopped (whether or not its process is running), when the instance is garbage-collected (e.g. after a
+            failed start), or at interpreter exit, whichever comes first
+        """
+        self._remove_ignored_compile_commands_dir()
+        ignored_dir = tempfile.mkdtemp(prefix="serena-clangd-no-compile-commands-")
+        self._ignored_compile_commands_dir = ignored_dir
+        self._ignored_compile_commands_dir_cleanup = weakref.finalize(self, _remove_temporary_directory, ignored_dir)
+        return ignored_dir
+
+    def _remove_ignored_compile_commands_dir(self) -> None:
+        if self._ignored_compile_commands_dir_cleanup is not None:
+            self._ignored_compile_commands_dir_cleanup()
+        self._ignored_compile_commands_dir_cleanup = None
+        self._ignored_compile_commands_dir = None
+
+    @override
+    def stop(self, shutdown_timeout: float = 2.0) -> None:
+        super().stop(shutdown_timeout=shutdown_timeout)
+        self._remove_ignored_compile_commands_dir()
+
     def _create_process_launch_info(self) -> ProcessLaunchInfo:
         """
-        Override to add --compile-commands-dir argument if we created a serena compilation database.
+        Override to add --compile-commands-dir argument if we created a serena compilation database, or if the
+        repository's database is ignored (an empty temporary directory, see :meth:`_prepare_compile_commands`).
         """
         # First, ensure the serena compile commands database is prepared
         compile_commands_dir = self._prepare_compile_commands()
@@ -213,7 +291,7 @@ class ClangdLanguageServer(SolidLanguageServer):
         # Get the default launch info from parent
         launch_info = super()._create_process_launch_info()
 
-        # If we created a serena compilation database, add --compile-commands-dir to the command
+        # If we created a serena compilation database (or the repository's is ignored), add --compile-commands-dir
         if compile_commands_dir:
             # Insert --compile-commands-dir after the executable path
             cmd = launch_info.cmd

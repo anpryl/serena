@@ -261,10 +261,16 @@ class VueLanguageServer(SolidLanguageServer):
         return ext in (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
 
     def _find_all_vue_files(self) -> list[str]:
+        """
+        :return: relative paths of all .vue files in the repo (excluding dot-paths, ignored paths, and files reached
+            through a symbolic link unless the configuration follows links)
+        """
         vue_files = []
         repo_path = Path(self.repository_root_path)
 
         for vue_file in repo_path.rglob("*.vue"):
+            if self._is_reached_through_unfollowed_link(vue_file):
+                continue
             try:
                 relative_path = str(vue_file.relative_to(repo_path))
                 if not relative_path.startswith(".") and not self.is_ignored_path(relative_path):
@@ -672,9 +678,11 @@ class VueLanguageServer(SolidLanguageServer):
         try:
             vue_ts_plugin_path = os.path.join(self._vue_ls_dir, "node_modules", "@vue", "typescript-plugin")
 
+            # the companion serves the same repository, so it keeps this server's symlink rule
             ts_config = LanguageServerConfig(
                 ls_id=LanguageServerId.TYPESCRIPT,
                 trace_lsp_communication=False,
+                follow_symlinks=self.config.is_following_symlinks(),
             )
 
             log.info("Creating companion VueTypeScriptServer")

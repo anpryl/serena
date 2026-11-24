@@ -39,6 +39,7 @@ class LanguageServerFactory:
         ls_specific_settings: dict | None = None,
         trace_lsp_communication: bool = False,
         is_project_trusted: bool = True,
+        follow_symlinks: bool = True,
         write_guard: WriteGuard | None = None,
     ):
         self.project_root = project_root
@@ -50,6 +51,7 @@ class LanguageServerFactory:
         self.ls_specific_settings = ls_specific_settings
         self.trace_lsp_communication = trace_lsp_communication
         self.is_project_trusted = is_project_trusted
+        self.follow_symlinks = follow_symlinks
         self.write_guard = write_guard
 
     def create_language_server(self, ls_id: LanguageServerIdLike) -> SolidLanguageServer:
@@ -61,6 +63,7 @@ class LanguageServerFactory:
             trace_lsp_communication=self.trace_lsp_communication,
             encoding=self.encoding,
             is_project_trusted=self.is_project_trusted,
+            follow_symlinks=self.follow_symlinks,
         )
 
         log.info(f"Creating language server instance for {self.project_root}, language={ls_id}.")
