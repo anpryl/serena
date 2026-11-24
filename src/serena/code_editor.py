@@ -411,17 +411,17 @@ class LanguageServerCodeEditor(CodeEditor[LanguageServerSymbol]):
 
         return operations
 
-    def _apply_workspace_edit(self, workspace_edit: ls_types.WorkspaceEdit) -> int:
+    def _apply_workspace_edit(self, workspace_edit: ls_types.WorkspaceEdit) -> list[EditOperation]:
         """
         Applies a WorkspaceEdit
 
         :param workspace_edit: the edit to apply
-        :return: number of edit operations applied
+        :return: the edit operations applied
         """
         operations = self._workspace_edit_to_edit_operations(workspace_edit)
         for operation in operations:
             operation.apply()
-        return len(operations)
+        return operations
 
     def rename_symbol(self, name_path: str, relative_path: str, new_name: str) -> str:
         """
@@ -449,10 +449,7 @@ class LanguageServerCodeEditor(CodeEditor[LanguageServerSymbol]):
                 f"Language server for {lang_server.language_id} returned no rename edits for symbol '{name_path}'. "
                 f"The symbol might not support renaming."
             )
-        n_other_uses = self._count_other_uses(lang_server, relative_path, symbol)
-        operations = self._workspace_edit_to_edit_operations(rename_result)
-        for operation in operations:
-            operation.apply()
+        operations = self._apply_workspace_edit(rename_result)
         num_changes = len(operations)
 
         if num_changes == 0:
@@ -461,6 +458,7 @@ class LanguageServerCodeEditor(CodeEditor[LanguageServerSymbol]):
             )
 
         changed_files = tuple(dict.fromkeys(path for operation in operations for path in operation.changed_relative_paths))
+        n_other_uses = self._count_other_uses(lang_server, relative_path, symbol) if changed_files == (relative_path,) else 0
         return RenameOutcome(
             name_path=name_path,
             new_name=new_name,

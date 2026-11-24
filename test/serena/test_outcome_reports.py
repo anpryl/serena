@@ -28,7 +28,7 @@ class TestRenameOutcome:
     def test_declaration_only_with_references_warns(self) -> None:
         message = self._outcome(("a.js",), 1, 3).message()
         assert "only the declaration was renamed" in message
-        assert "rename them by hand" in message
+        assert "rename the remaining uses by hand" in message
 
     def test_declaration_only_without_references_does_not_warn(self) -> None:
         assert "Warning" not in self._outcome(("a.js",), 1, 0).message()

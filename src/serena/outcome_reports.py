@@ -20,7 +20,7 @@ class RenameOutcome:
     declaration_file: str
     """the file that declares the renamed symbol, relative to the project root"""
     n_other_uses: int
-    """the number of uses of the symbol outside its declaration (references the language server reports, or other files that mention the name)"""
+    """the number of uses of the symbol outside its declaration (references the language server reports, or other files that mention the name); 0 if it was not determined, which it is only when the rename changed a file other than the declaration file"""
 
     @property
     def only_declaration_edited(self) -> bool:
@@ -39,7 +39,7 @@ class RenameOutcome:
                 f"\nWarning: only the declaration was renamed, but {self.n_other_uses} "
                 "other use(s) of the name exist and were left unchanged. The language server may not know the "
                 "project's other files (e.g. a JavaScript project without jsconfig.json or tsconfig.json). "
-                "Check the uses with search_for_pattern and rename them by hand."
+                "Search the project for the name and rename the remaining uses by hand."
             )
         return msg
 
