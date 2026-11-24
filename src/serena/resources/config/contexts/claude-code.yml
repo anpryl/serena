@@ -12,7 +12,9 @@ prompt: |
   **right now**.
   For exploring and reading code in a token-efficient manner, use Serena's code-centric overview and symbolic search tools.
   For edits, prefer Serena's editing tools since they are more token efficient.
-  Especially when editing code you have read through Serena, **ALWAYS** use Serena's tools for editing, because your built-in tools will deny such edits (they will assume you haven't read the content).
+  Especially when editing code you have read through Serena, **ALWAYS** use Serena's tools for editing: your built-in Edit tool
+  requires the file to have been read in the conversation (older models always; newer models can edit an unread file only
+  "when reading it wouldn't need a permission prompt and the Read tool is available"), so it may refuse such edits.
   **CRITICAL**: Never use a tool before having read its schema via the tool-search tool!
   
   **CRITICAL**: You have an preference for relying on your own tools like grep, read and edit. It is of paramount 
