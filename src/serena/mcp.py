@@ -363,6 +363,9 @@ class SerenaMCPFactory:
         trace_lsp_communication: bool | None = None,
         tool_timeout: float | None = None,
         project_activation_error: str | None = None,
+        project_registry: bool | None = None,
+        read_only_config: bool | None = None,
+        untrusted: bool = False,
     ) -> FastMCP:
         """
         Create an MCP server with process-isolated SerenaAgent to prevent asyncio contamination.
@@ -380,6 +383,10 @@ class SerenaMCPFactory:
             This is useful for debugging language server issues.
         :param tool_timeout: Timeout in seconds for tool execution. If not specified, will take the value from the serena configuration.
         :param project_activation_error: an initial project activation error to report back to the client
+        :param project_registry: whether to keep a persistent project registry, overriding the configuration setting
+        :param read_only_config: whether to forbid writing the configuration file, overriding the configuration setting
+            (a value of False cannot make writable a file whose own ``read_only_config`` is set)
+        :param untrusted: whether to treat every project as untrusted in this process
         """
         try:
             config = SerenaConfig.from_config_file()
@@ -402,6 +409,12 @@ class SerenaMCPFactory:
                 config.language_backend = language_backend
             if agent_interface is not None:
                 config.agent_interface = agent_interface
+            if project_registry is not None:
+                config.set_project_registry(project_registry)
+            if read_only_config is not None:
+                config.read_only_config = read_only_config
+            if untrusted:
+                config.set_untrusted()
 
             self.agent = self._create_serena_agent(config, modes=mode_selection_def, project_activation_error=project_activation_error)
 

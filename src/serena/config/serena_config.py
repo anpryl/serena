@@ -918,6 +918,8 @@ class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
     """
     _projects_at_load: set[str] = field(default_factory=set, repr=False)
     """Project roots present when this configuration instance was last persisted."""
+    _untrusted: bool = False
+    """whether every project is untrusted in this process, regardless of ``trusted_project_path_patterns``"""
 
     # *** static members ***
 
@@ -1558,13 +1560,34 @@ class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
 
         JetBrainsPluginClient.set_server_address(self.jetbrains_plugin_server_address)
 
+    def set_project_registry(self, enabled: bool) -> None:
+        """
+        Overrides ``project_registry`` for this process. Turning the registry off also drops the projects
+        that were read from the file, so that names resolve only for projects activated by this process.
+
+        :param enabled: the value of ``project_registry`` to use
+        """
+        self.project_registry = enabled
+        if not enabled:
+            self.projects = []
+            self._projects_at_load = set()
+
+    def set_untrusted(self) -> None:
+        """
+        Makes every project untrusted for this process, see :meth:`is_trusted_project_path`.
+        """
+        self._untrusted = True
+
     def is_trusted_project_path(self, project_root: str | Path) -> bool:
         """
         Checks if the given project root path matches any of the trusted project root patterns.
+        Nothing is trusted if the configuration was made untrusted via :meth:`set_untrusted`.
 
         :param project_root: the path to the project root directory
         :return: True if the project root is trusted, False otherwise
         """
+        if self._untrusted:
+            return False
         project_root_str = str(project_root)
         for pattern in self.trusted_project_path_patterns:
             if GlobMatcher(pattern).matches(project_root_str):

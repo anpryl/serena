@@ -384,6 +384,27 @@ class TopLevelCommands(AutoRegisteringGroup):
         default=False,
         help="Auto-detect project from current working directory (nearest ancestor containing .serena/project.yml or .git). If none is found, no project is activated. Intended for CLI-based agents like Claude Code, Gemini and Codex.",
     )
+    @click.option(
+        "--project-registry",
+        type=bool,
+        is_flag=False,
+        default=None,
+        help="Whether to keep a persistent project registry (overriding the setting in Serena's config).",
+    )
+    @click.option(
+        "--read-only-config",
+        type=bool,
+        is_flag=False,
+        default=None,
+        help="Whether Serena is forbidden from writing its config file (overriding the setting in Serena's config; "
+        "false cannot make writable a file that sets read_only_config itself).",
+    )
+    @click.option(
+        "--untrusted",
+        is_flag=True,
+        default=False,
+        help="Treat every project as untrusted in this process, regardless of trusted_project_path_patterns.",
+    )
     def start_mcp_server(
         project: str | None,
         project_file_arg: str | None,
@@ -402,6 +423,9 @@ class TopLevelCommands(AutoRegisteringGroup):
         log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] | None,
         trace_lsp_communication: bool | None,
         tool_timeout: float | None,
+        project_registry: bool | None,
+        read_only_config: bool | None,
+        untrusted: bool,
     ) -> None:
         from serena.mcp import SerenaMCPFactory, uvicorn_ignore_logging_config_context
 
@@ -459,6 +483,9 @@ class TopLevelCommands(AutoRegisteringGroup):
             trace_lsp_communication=trace_lsp_communication,
             tool_timeout=tool_timeout,
             project_activation_error=project_activation_error,
+            project_registry=project_registry,
+            read_only_config=read_only_config,
+            untrusted=untrusted,
         )
         if project_file_arg:
             log.warning(
