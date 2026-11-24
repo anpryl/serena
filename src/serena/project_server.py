@@ -74,6 +74,7 @@ class ProjectServer:
             port = self.PORT
 
         serena_config = SerenaConfig.from_config_file().with_headless_mode_overrides()
+        serena_config.ensure_project_queries_available()
         serena_config.set_builtin_language_backend(BuiltinLanguageBackend.LSP)
 
         self._agent = SerenaAgent(serena_config=serena_config)

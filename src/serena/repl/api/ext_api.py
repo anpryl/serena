@@ -41,6 +41,7 @@ class ExternalProjectContextManager:
             raise ValueError("External project contexts cannot be nested")
 
         # temporarily activate the external project
+        self._agent.serena_config.ensure_project_queries_available()
         registered_project = self._agent.serena_config.get_registered_project(self._project_name)
         if registered_project is None:
             raise ValueError(f"Project '{self._project_name}' is not registered and cannot be queried")
@@ -69,7 +70,7 @@ class ExternalProjectsApi(FacadeApi):
         :param symbol_access: whether to list only projects for which symbol-level access is available
         :return: the project names mapped to their root directories
         """
-        registered_projects = self._agent.serena_config.projects
+        registered_projects = self._agent.serena_config.queryable_projects
         if symbol_access and self._agent.get_language_backend().is_jetbrains():
             # only projects with open IDE instances can be queried
             matched_clients = JetBrainsPluginClientManager().match_clients(registered_projects)

@@ -20,7 +20,7 @@ class ListQueryableProjectsTool(Tool, ToolMarkerOptional, ToolMarkerDoesNotRequi
         :return: project names and roots
         """
         # determine relevant projects
-        registered_projects = self.agent.serena_config.projects
+        registered_projects = self.agent.serena_config.queryable_projects
         if symbol_access:
             backend = self.agent.get_language_backend()
             if backend.is_jetbrains():
@@ -53,6 +53,7 @@ class QueryProjectTool(Tool, ToolMarkerOptional, ToolMarkerDoesNotRequireActiveP
         :param tool_name: the name of the tool to execute in the other project. The tool must be read-only.
         :param tool_params_json: the parameters to pass to the tool, encoded as a JSON string
         """
+        self.agent.serena_config.ensure_project_queries_available()
         tool = self.agent.get_tool_by_name(tool_name)
         if not tool.is_readonly():
             raise ValueError(f"Tool {tool_name} is not read-only and cannot be executed in another project.")

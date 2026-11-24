@@ -1583,10 +1583,7 @@ class SerenaAgent:
             log.info(f"Added new project {project_instance.project_name} for path {project_instance.project_root}")
 
         if project_instance is None:
-            raise ProjectNotFoundError(
-                f"Project '{project_root_or_name}' not found: Not a valid project name or directory. "
-                f"Existing project names: {self.serena_config.project_names}"
-            )
+            raise ProjectNotFoundError(self.serena_config.unknown_project_message(project_root_or_name))
 
         return self._activate_project(project_instance, update_active_modes=update_active_modes, update_active_tools=update_active_tools)
 

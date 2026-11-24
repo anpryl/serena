@@ -251,5 +251,11 @@ trusted_project_path_patterns: []
 # Keep this value private. When missing, null, or empty, a random UUID is generated and saved on load.
 auth_secret:
 
-# the list of registered project paths (updated automatically).
+# whether Serena keeps a persistent registry of projects in the `projects` list below.
+# If false, the list is neither read nor written (it may be omitted), projects exist in memory only,
+# a project can be activated by path but not by the name of a project this process has not activated,
+# and `query_project`, `list_queryable_projects` and the project server are unavailable.
+project_registry: true
+
+# the list of registered project paths (updated automatically; ignored if project_registry is false).
 projects: []

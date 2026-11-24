@@ -1249,7 +1249,7 @@ class MemoryCommands(AutoRegisteringGroup):
         if no project configuration is found, the user is directed at ``serena project create``.
         """
         serena_config = SerenaConfig.from_config_file()
-        registered_project = serena_config.get_registered_project(project)
+        registered_project = serena_config.get_registered_project_for_inspection(project)
         if registered_project is None:
             raise click.UsageError(f"No Serena project found for '{project}'. Create one first.")
         return registered_project.get_project_instance(serena_config).memory_manager

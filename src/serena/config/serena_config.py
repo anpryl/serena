@@ -803,6 +803,12 @@ class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
 
     # *** fields that are mapped directly to/from the configuration file (DO NOT RENAME) ***
 
+    project_registry: bool = True
+    """
+    whether Serena keeps a persistent registry of projects in the ``projects`` list of the configuration file.
+    If False, the list is neither read nor written, projects exist in memory only, names resolve only
+    for projects activated by this process, and cross-project queries are unavailable.
+    """
     projects: list[RegisteredProject] = field(default_factory=list)
     auth_secret: str = field(default_factory=lambda: str(uuid4()), repr=False)
     """
@@ -1019,10 +1025,10 @@ class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
             num_migrations += 1
 
         # read projects
-        if "projects" not in loaded_commented_yaml:
+        if instance.project_registry and "projects" not in loaded_commented_yaml:
             raise SerenaConfigError("`projects` key not found in Serena configuration. Please update your `serena_config.yml` file.")
         instance.projects = []
-        for path in loaded_commented_yaml["projects"] or []:
+        for path in (loaded_commented_yaml["projects"] or []) if instance.project_registry else []:
             path = Path(path).resolve()
             try:
                 path_exists = path.exists()
@@ -1218,9 +1224,43 @@ class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
         else:
             return registered_project.get_project_instance(serena_config=self)
 
+    def get_registered_project_for_inspection(self, project_root_or_name: str) -> Optional[RegisteredProject]:
+        """
+        Like :meth:`get_registered_project`, for commands that only inspect a project in a fresh process.
+        With the project registry off, a path holding a project configuration file resolves in memory.
+
+        :param project_root_or_name: path to the project root or the name of the project
+        :return: the registered project, or None if not found
+        """
+        return self.get_registered_project(project_root_or_name, autoregister=not self.project_registry)
+
+    def unknown_project_message(self, project_root_or_name: str) -> str:
+        """
+        :param project_root_or_name: the name or path that could not be resolved to a project
+        :return: the message explaining that the project was not found
+        """
+        message = f"Project '{project_root_or_name}' not found: Not a valid project name or directory. "
+        if self.project_registry:
+            return message + f"Existing project names: {self.project_names}"
+        return message + "The project registry is off (`project_registry: false`); activate by path."
+
+    @property
+    def queryable_projects(self) -> list[RegisteredProject]:
+        """
+        :return: the registered projects that cross-project queries can address, none if the project registry is off
+        """
+        return list(self.projects) if self.project_registry else []
+
+    def ensure_project_queries_available(self) -> None:
+        """
+        Raises a ValueError naming the ``project_registry`` setting if cross-project queries are unavailable.
+        """
+        if not self.project_registry:
+            raise ValueError("Cross-project queries are unavailable because the project registry is off (`project_registry: false`).")
+
     def add_registered_project(self, registered_project: RegisteredProject) -> None:
         """
-        Adds a registered project, persisting the updated project list
+        Adds a registered project, persisting the updated project list (unless the project registry is off)
         """
         self.projects.append(registered_project)
         self._persist_projects()
@@ -1321,7 +1361,7 @@ class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
         disk copy before the other writes, and the later write silently discards whichever
         process's change was not yet on disk when the other one read.
         """
-        if self.config_file_path is None:
+        if self.config_file_path is None or not self.project_registry:
             return
 
         with FileLock(self.config_file_path + ".lock"):
@@ -1367,7 +1407,8 @@ class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
             commented_yaml[field_name] = getattr(self, field_name)
 
         # convert project objects into list of paths
-        commented_yaml["projects"] = sorted({str(project.project_root) for project in self.projects})
+        if self.project_registry:
+            commented_yaml["projects"] = sorted({str(project.project_root) for project in self.projects})
 
         # convert language backend to string
         commented_yaml["language_backend"] = self.language_backend.get_key()
