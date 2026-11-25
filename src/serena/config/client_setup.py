@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 
 import click
 
+from serena.config.claude_code_settings import ClaudeCodeSettings, SettingsFileError
 from serena.util.shell import execute_shell_command
 
 
@@ -69,6 +70,28 @@ class ClientSetupHandlerClaudeCode(ClientSetupHandler):
             click.echo("   Please read the instructions here:")
             click.echo("   https://oraios.github.io/serena/02-usage/030_clients.html#claude-code")
         return is_success
+
+    def apply_follow_cwd(self) -> bool:
+        """
+        Registers the ``--follow-cwd`` router as the user-level MCP server ``serena`` (replacing an existing one) and
+        merges the hooks of that mode into the user's ``settings.json``.
+        """
+        if execute_shell_command("claude mcp get serena", capture_stderr=True).return_code == 0:
+            if not self._run_shell_command("claude mcp remove -s user serena"):
+                return False
+        if not self._run_shell_command("claude mcp add --scope user serena -- serena start-mcp-server --context=claude-code --follow-cwd"):
+            return False
+        settings = ClaudeCodeSettings.user_settings()
+        try:
+            changes = settings.install_follow_cwd_hooks()
+        except SettingsFileError as e:
+            click.echo(str(e))
+            return False
+        click.echo(f"\nHooks in {settings.path}:")
+        for change in changes or ["no change, all hooks were already in place"]:
+            click.echo(f"  {change}")
+        click.echo("\nRestart Claude Code to pick up the server and the hooks.")
+        return True
 
 
 class ClientSetupHandlerCodex(ClientSetupHandler):

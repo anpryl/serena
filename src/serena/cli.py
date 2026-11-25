@@ -23,7 +23,7 @@ from sensai.util.string import dict_string
 from tqdm import tqdm
 
 from serena import serena_version
-from serena.config.client_setup import client_setup_handlers
+from serena.config.client_setup import ClientSetupHandlerClaudeCode, client_setup_handlers
 from serena.config.context_mode import SerenaAgentContext, SerenaAgentMode
 from serena.config.serena_config import (
     AgentInterface,
@@ -229,9 +229,17 @@ class TopLevelCommands(AutoRegisteringGroup):
         "client",
         type=click.Choice([h.name for h in client_setup_handlers]),
     )
-    def setup(client: str) -> None:
+    @click.option(
+        "--follow-cwd",
+        is_flag=True,
+        help="Claude Code only: register the `--follow-cwd` router (one server that follows each session's folder) "
+        "and add its hooks to ~/.claude/settings.json.",
+    )
+    def setup(client: str, follow_cwd: bool) -> None:
         # find the matching handler
         handler = next(h for h in client_setup_handlers if h.name == client)
+        if follow_cwd and not isinstance(handler, ClientSetupHandlerClaudeCode):
+            raise click.UsageError("--follow-cwd is only supported for claude-code.")
 
         # check applicability
         if not handler.is_applicable():
@@ -239,7 +247,8 @@ class TopLevelCommands(AutoRegisteringGroup):
             raise SystemExit(1)
 
         # apply the setup
-        if handler.apply():
+        applied = handler.apply_follow_cwd() if isinstance(handler, ClientSetupHandlerClaudeCode) and follow_cwd else handler.apply()
+        if applied:
             click.echo(f"\nSerena has been successfully set up for {client}.\n")
         else:
             click.echo(f"\nFailed to set up Serena for {client}.\n")
