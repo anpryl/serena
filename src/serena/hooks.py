@@ -878,5 +878,28 @@ class HookCommands(AutoRegisteringGroup):
     def reset(client: str) -> None:
         PostToolUseResetSymbolicToolCounterHook(HookClient(client)).execute()
 
+    @staticmethod
+    @click.command(
+        "code-guard",
+        help="Set this as a Claude Code hook at PreToolUse, matched to Read|Bash, to deny the first Read or Bash read/write of a code file "
+        "that Serena has not covered yet. Needs the code-file list that `serena start-mcp-server --follow-cwd` writes.",
+    )
+    @_client_option
+    def code_guard(client: str) -> None:
+        from serena.hooks_code_guard import CodeFileGuardHook
+
+        CodeFileGuardHook(HookClient(client)).execute()
+
+    @staticmethod
+    @click.command(
+        "code-guard-record",
+        help="Set this as a Claude Code hook at PostToolUse, matched to Serena's tools, to record the files they covered for `code-guard`.",
+    )
+    @_client_option
+    def code_guard_record(client: str) -> None:
+        from serena.hooks_code_guard import CoveredFilesRecorderHook
+
+        CoveredFilesRecorderHook(HookClient(client)).execute()
+
 
 hook_commands = HookCommands()
