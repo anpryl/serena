@@ -33,6 +33,30 @@ Status of the `main` branch. Changes prior to the next official version change w
     language servers are stopped or restarted
   - Fix: the default connection prompt made some agents call `initial_instructions` again for every new task in a
     conversation, although the Serena Instructions Manual was still in context (#2293)
+  - Add setting `project_registry` (default `true`). If `false`, Serena neither reads nor writes the `projects` list,
+    and `query_project`, `list_queryable_projects` and the project server are unavailable
+  - Add setting `read_only_config` (default `false`). If `true`, Serena never writes `serena_config.yml`. Changes it
+    would persist stay in memory, and `serena init` and the dashboard's config editor fail
+  - Add `start-mcp-server` options `--project-registry`, `--read-only-config` and `--untrusted`, which override
+    these settings and `trusted_project_path_patterns` for one process
+  - `rename_symbol` names the files it changed, and warns when it changed only the declaration although other uses
+    of the name exist (e.g. a JavaScript project without `jsconfig.json` or `tsconfig.json`)
+  - `find_symbol`: an empty result for a name path such as `Calculator/Add` in a Go file suggests `Add`, since Go
+    methods are top-level symbols
+
+* Claude Code:
+  - Add `start-mcp-server --follow-cwd`, a router that holds no project. Every tool takes a required `cwd`, and each
+    call goes to a child Serena started on the project root of that folder, so it behaves as in a Serena freshly
+    launched there. Projects outside Claude Code's working directories run untrusted. The router and its children
+    run with `project_registry: false`, `read_only_config: true` and the `tools` interface. Each router writes its
+    children's states to `<SERENA_HOME>/follow_cwd/state/<pid>.json` for a status line
+  - Add `serena setup claude-code --follow-cwd`, which registers the router in place of an existing user-level
+    `serena` server and merges the mode's hooks into `~/.claude/settings.json`
+  - Add hooks for the `--follow-cwd` mode: `check-cwd`, `code-guard`, `code-guard-record`, `brief-subagent` and
+    `reorient`. `activate` takes `--follow-cwd`, and `--project-given` for a server started with a project, so that
+    it no longer tells the agent to call `activate_project` where that tool does not exist
+  - Fix: the `claude-code` context said that Claude Code's built-in tools deny edits to code read through Serena.
+    It now states Claude Code's documented condition for editing a file that was not read
 
 * JetBrains:
   - Fix: When applying a non-symbolic edit, do not raise a post-edit exception during IDE file refresh
