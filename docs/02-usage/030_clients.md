@@ -202,6 +202,168 @@ The hooks will:
 For more details on Claude Code's hook system, see the
 [Claude Code hooks documentation](https://code.claude.com/docs/en/hooks).
 
+(claude-code-follow-cwd)=
+### Following the Session's Folder (`--follow-cwd`)
+
+With `--project-from-cwd`, Serena picks one project when Claude Code starts and keeps it, even after Claude Code
+moves to another folder or worktree. With `--follow-cwd`, Serena starts a router that holds no project. The router
+sends each tool call to a child Serena started on the project root of the call's folder. A call therefore behaves
+as it would in a Serena freshly launched in that folder, with that project's configuration, trust, language servers,
+memories and instructions.
+
+**Setup.** Run:
+
+```shell
+serena setup claude-code --follow-cwd
+```
+
+The command does the following:
+
+- If `claude mcp get serena` finds a server, it runs `claude mcp remove -s user serena`.
+- It registers the router with
+  `claude mcp add --scope user serena -- serena start-mcp-server --context=claude-code --follow-cwd`.
+- It adds the hooks below to `~/.claude/settings.json`. Other keys and hooks stay as they are. An existing
+  `serena-hooks activate` entry is replaced by `serena-hooks activate --follow-cwd`. The file is written atomically,
+  and a second run changes nothing.
+- It prints every change it made.
+
+Restart Claude Code afterwards. To set it up by hand, register the router with the `claude mcp add` command above
+and add these hooks to `~/.claude/settings.json`:
+
+```json
+{
+    "hooks": {
+        "PreToolUse": [
+            {"matcher": "mcp__serena__.*", "hooks": [{"type": "command", "command": "serena-hooks check-cwd"}]},
+            {"matcher": "Read|Bash", "hooks": [{"type": "command", "command": "serena-hooks code-guard"}]}
+        ],
+        "PostToolUse": [
+            {"matcher": "mcp__serena__.*", "hooks": [{"type": "command", "command": "serena-hooks code-guard-record"}]}
+        ],
+        "SubagentStart": [
+            {"matcher": "", "hooks": [{"type": "command", "command": "serena-hooks brief-subagent"}]}
+        ],
+        "SessionStart": [
+            {"matcher": "startup", "hooks": [{"type": "command", "command": "serena-hooks activate --follow-cwd"}]},
+            {"matcher": "clear|compact", "hooks": [{"type": "command", "command": "serena-hooks reorient"}]}
+        ]
+    }
+}
+```
+
+`--follow-cwd` requires the stdio transport and cannot be combined with `--project`, `--project-from-cwd` or a
+project argument. The router and every child run with `project_registry: false`, `read_only_config: true` and the
+`tools` agent interface, whatever `serena_config.yml` says. So visited projects are not registered, and Serena does
+not write `serena_config.yml`. Children run without the dashboard and the GUI log window.
+
+**The `cwd` argument.** Every tool takes a required `cwd`, the caller's working directory as an absolute path.
+The agent passes the folder it is in, and after a `cd`, the new folder.
+
+- A call without `cwd`, with a relative `cwd` or with a `cwd` that is not a directory fails, and the error names
+  the argument.
+- The project is the nearest folder above `cwd` that holds `.serena/project.yml` or `.git`. A git worktree, even one
+  nested in another project, is a project of its own.
+- An absolute path argument selects the project it lies in, in place of `cwd`. A call whose absolute paths lie in
+  different projects is refused.
+- Relative paths in the other arguments are relative to the project root, not to `cwd`.
+- Paths in results are relative to the project root when `cwd` lies inside the project, and absolute otherwise.
+- The first result from each project carries that project's instructions. Results from a project other than the
+  launch folder's begin with a `[serena project <name> at <root>]` line.
+- Calls to different projects can run at the same time.
+
+The router marks `get_symbols_overview`, `find_symbol`, `find_referencing_symbols`, `replace_symbol_body` and
+`replace_content` to load upfront (`anthropic/alwaysLoad`). Every tool declares `anthropic/maxResultSizeChars` of
+200,000, so Claude Code shows results up to that size inline. The router cuts a longer result and appends a notice
+that names the arguments for a narrower call.
+
+**Children.** The router starts the launch folder's child when Claude Code connects, if that folder is in a project.
+Other children start on their project's first call. A child that no call has used for 60 minutes stops. When 8
+children run, starting another one first stops the least recently used idle child. The next call to a stopped or
+crashed child's project starts it again.
+
+**The hooks.** Each hook is optional. Without them, every call still goes to the project of its `cwd`.
+
+| Hook | Event and matcher | What it does | What it never does |
+| --- | --- | --- | --- |
+| `check-cwd` | PreToolUse, `mcp__serena__.*` | Adds a notice when the project of the call's `cwd` differs from the project of the shell's folder | Block or change the call |
+| `code-guard` | PreToolUse, `Read\|Bash` | Denies the first `Read`, shell read (`cat`, `head`, `tail`, `sed`, `awk`, `less`, `more`, `bat`) or shell write (such as `>`, `tee` or `sed -i`) of a code file that Serena has not covered in this session. The reason names the Serena tools to use | Deny a search (`grep`, `rg`), a second attempt at the same file, a shell write that creates a file, or a file in a project whose child has not started in this session |
+| `code-guard-record` | PostToolUse, `mcp__serena__.*` | Records the files named in a Serena call and in its result as covered | Change the result |
+| `brief-subagent` | SubagentStart | Tells the subagent its folder and project, to pass that folder as `cwd`, and to call `initial_instructions` | Send the instructions themselves |
+| `activate --follow-cwd` | SessionStart, `startup` | Tells the agent to pass `cwd` on every call and to call `initial_instructions` | Ask the agent to activate a project |
+| `reorient` | SessionStart, `clear\|compact` | Names the project and its root, and tells the agent to call `initial_instructions` with that `cwd` | Send the instructions themselves |
+
+A code file is a file whose extension one of the project's language servers handles. When a child starts, the
+router writes that list to `<SERENA_HOME>/follow_cwd/`, and `code-guard` reads it. A project with the JetBrains
+backend gets no list, so `code-guard` passes its files. `code-guard` and `code-guard-record` work together, so
+install both or neither. Setup installs neither `remind`, which `code-guard` replaces, nor `auto-approve`. If you add
+`auto-approve` by hand, note that in `auto` mode it allows Serena's edit tools without auto mode's own check.
+
+**Trust.** A project inside a Claude Code working directory (the launch folder, or a folder added with `/add-dir`)
+is trusted as a fresh launch there would be, so `trusted_project_path_patterns` decides. A project counts as inside
+when its root lies inside a working directory or a working directory lies inside its root. A project outside
+every working directory, which a call reaches by an absolute path or a `cwd` elsewhere (for example a sibling
+worktree), runs in Serena's [untrusted mode](trusted-projects-config). Its `activation_command` and its
+project-level `ls_specific_settings` are ignored. A setting that such a project needs, such as `ls_path`, must go in
+the global `serena_config.yml`. The router reads the working directories from the client's MCP roots. Without
+roots, only the launch folder counts.
+
+**One language server per language.** Claude Code's code-intelligence plugins start their own language server for
+each language they support. For a language that Serena also serves, two servers then run, which costs memory and
+gives two sources of diagnostics. Disable the plugin for each language Serena serves, or accept the second server.
+Each child also has its own language servers, and two Claude Code sessions on one project start two children.
+
+**Where it differs from a fresh launch.**
+
+- **A wrong `cwd`.** A call goes to the project of the folder the agent declares. `check-cwd` reports a mismatch
+  with the shell's folder, which is reliable in the main session. A subagent that ran `cd` has no second source to
+  check against.
+- **The tool list is the router's.** The router lists the tools of the `claude-code` context and the global
+  configuration, so it lists the same tools in every project. A tool that one project excludes is still listed, and
+  a call to it in that project fails. An optional tool that a project includes is not listed, unless the global
+  configuration includes it as well.
+- **Outside the working directories,** a project runs untrusted (see **Trust** above).
+- **`.serena/` in a followed folder.** A child on a project without `.serena/project.yml` creates it, along with
+  a cache, as a fresh launch does. In a git worktree, `git worktree remove` then needs `--force`.
+- **`code-guard` covers only projects opened in this session.** The first `Read` in a project that has no child yet
+  passes.
+
+**Status line.** Claude Code passes no MCP state to a status line, so each router writes
+`<SERENA_HOME>/follow_cwd/state/<router pid>.json` (`SERENA_HOME` defaults to `~/.serena`):
+
+```json
+{"pid": 4242, "launch_root": "/home/me/app", "children": [{"root": "/home/me/app", "name": "app", "state": "idle"}]}
+```
+
+`launch_root` is the project root of the folder the router started in, or that folder if it is in no project.
+`state` is `starting`, `ready` (a call is running) or `idle`. The router rewrites the file when a child starts,
+stops or changes state, and removes it on exit. A router that was killed leaves its file behind. This script, which
+needs `jq`, prints the children of the routers that belong to the session. It keeps the files whose `launch_root`
+is the session's launch folder (`workspace.project_dir`) or contains it, and whose process is still alive:
+
+```bash
+#!/bin/bash
+project_dir=$(cd "$(jq -r '.workspace.project_dir')" 2>/dev/null && pwd -P) || exit 0
+for file in "${SERENA_HOME:-$HOME/.serena}"/follow_cwd/state/*.json; do
+    [ -f "$file" ] || continue
+    pid=$(jq -r '.pid' "$file")
+    launch_root=$(jq -r '.launch_root' "$file")
+    kill -0 "$pid" 2>/dev/null || continue
+    case "$project_dir/" in
+        "$launch_root"/*) ;;
+        *) continue ;;
+    esac
+    jq -r 'select(.children | length > 0) | "serena: " + ([.children[] | "\(.name) (\(.state))"] | join(", "))' "$file"
+done
+```
+
+Save it as `~/.claude/serena-statusline.sh`, make it executable, and add it to `~/.claude/settings.json`:
+
+```json
+{"statusLine": {"type": "command", "command": "~/.claude/serena-statusline.sh"}}
+```
+
+Two sessions launched in the same project both match, so the script then prints a line for each router.
+
 ## DeepSeek Harness (DSH)
 
 Connect Serena as an MCP server using the [general instructions](#clients-general-instructions).
