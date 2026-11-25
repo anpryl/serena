@@ -8,6 +8,7 @@ import shlex
 import shutil
 import sys
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -16,6 +17,7 @@ from typing import Literal, Self
 
 import click
 
+from serena import hooks_follow_cwd
 from serena.generated.tool_capabilities import EDIT_CAPABLE_TOOL_NAMES
 from serena.util.cli_util import AutoRegisteringGroup
 
@@ -685,17 +687,43 @@ class PostToolUseResetSymbolicToolCounterHook(Hook):
 
 
 class SessionStartActivateProjectHook(Hook):
-    def execute(self) -> None:
-        message = (
+    def __init__(self, client: HookClient, follow_cwd: bool = False, project_given: bool = False):
+        """
+        :param follow_cwd: whether the session talks to the ``--follow-cwd`` router: the agent passes ``cwd`` on every
+            call and never activates a project
+        :param project_given: whether Serena was started with a project, so it offers no ``activate_project`` tool
+        """
+        super().__init__(client)
+        self._follow_cwd = follow_cwd
+        self._project_given = project_given
+
+    def _message(self) -> str:
+        if self._follow_cwd:
+            return (
+                "**IMPORTANT**: If the current directory is a coding project you are working on:"
+                " 1. pass your working directory as `cwd` on every Serena call (after `cd`, the new folder);"
+                " there is no project to activate. "
+                " 2. if you haven't read Serena Instructions Manual yet, call `initial_instructions` with that `cwd`. "
+                "Follow this instruction before doing anything else."
+            )
+        if self._project_given:
+            return (
+                "**IMPORTANT**: If the current directory is a coding project you are working on:"
+                " if you haven't read Serena Instructions Manual yet, do so. "
+                "Follow this instruction before doing anything else."
+            )
+        return (
             "**IMPORTANT**: If the current directory is a coding project you are working on:"
             " 1. activate it using Serena's activate_project tool unless already done. "
             " 2. if you haven't read Serena Instructions Manual yet, do so. "
             "Follow this instruction before doing anything else."
         )
+
+    def execute(self) -> None:
         result = {
             "hookSpecificOutput": {
                 "hookEventName": "SessionStart",
-                "additionalContext": message,
+                "additionalContext": self._message(),
             }
         }
         click.echo(json.dumps(result))
@@ -820,9 +848,13 @@ class HookCommands(AutoRegisteringGroup):
         "activate",
         help="Set this as hook at session startup to prompt the agent to activate the project at the start of the session and read Serena's instructions",
     )
+    @click.option(
+        "--follow-cwd", is_flag=True, help="The session talks to a `--follow-cwd` router: say to pass `cwd`, not to activate a project."
+    )
+    @click.option("--project-given", is_flag=True, help="Serena was started with a project, so it offers no `activate_project` tool.")
     @_client_option
-    def activate(client: str) -> None:
-        SessionStartActivateProjectHook(HookClient(client)).execute()
+    def activate(client: str, follow_cwd: bool, project_given: bool) -> None:
+        SessionStartActivateProjectHook(HookClient(client), follow_cwd=follow_cwd, project_given=project_given).execute()
 
     @staticmethod
     @click.command("cleanup", help="Set this as hook at session end all hook data for the current session")
@@ -900,6 +932,28 @@ class HookCommands(AutoRegisteringGroup):
         from serena.hooks_code_guard import CoveredFilesRecorderHook
 
         CoveredFilesRecorderHook(HookClient(client)).execute()
+
+    # --follow-cwd hooks; the logic is in serena.hooks_follow_cwd
+    @staticmethod
+    @click.command("check-cwd", help="PreToolUse on Serena's tools: say when a call's `cwd` is in another project than the shell.")
+    def check_cwd() -> None:
+        _echo_follow_cwd_output(hooks_follow_cwd.check_cwd_output)
+
+    @staticmethod
+    @click.command("brief-subagent", help="SubagentStart: brief the subagent on its folder and the `cwd` argument.")
+    def brief_subagent() -> None:
+        _echo_follow_cwd_output(hooks_follow_cwd.brief_subagent_output)
+
+    @staticmethod
+    @click.command("reorient", help="SessionStart, matchers clear|compact: point the agent back to `initial_instructions`.")
+    def reorient() -> None:
+        _echo_follow_cwd_output(hooks_follow_cwd.reorient_output)
+
+
+def _echo_follow_cwd_output(build_output: Callable[[dict], str | None]) -> None:
+    output = build_output(json.loads(sys.stdin.read(), strict=False))
+    if output is not None:
+        click.echo(output)
 
 
 hook_commands = HookCommands()
