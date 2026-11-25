@@ -10,6 +10,7 @@ from serena.mcp import SerenaFastMCPTool
 from serena.router.call_target import CallTargetResolver
 from serena.router.result_cap import ResultCap
 from serena.router.router import Router
+from serena.router.working_directories import ClientRoots
 from serena.tools import Tool
 
 log = logging.getLogger(__name__)
@@ -38,7 +39,7 @@ class RouterTool(SerenaFastMCPTool):
         self._router = router
 
     async def run(self, arguments: dict[str, Any], context: Context, convert_result: bool = False) -> Any:
-        return await self._router.route(self.name, arguments)
+        return await self._router.route(self.name, arguments, ClientRoots(context.request_context.session))
 
 
 class RouterToolCatalog:

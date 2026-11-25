@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -20,8 +21,10 @@ import psutil
 import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from mcp_types import CallToolResult
+from mcp_types import CallToolResult, ErrorData, ListRootsResult, Root
 
+from serena.router.call_target import CallTarget
+from serena.router.child_pool import ChildOptions, ChildPool
 from solidlsp.ls_config import LanguageServerId
 from test.conftest import get_repo_path
 
@@ -31,6 +34,8 @@ T = TypeVar("T")
 PYTHON_REPO = get_repo_path(LanguageServerId.PYTHON)
 SUBFOLDER = "test_repo"
 ALWAYS_LOADED = {"get_symbols_overview", "find_symbol", "find_referencing_symbols", "replace_symbol_body", "replace_content"}
+HEADER_PREFIX = "[serena project "
+ACTIVATION_PREFIX = "<serena>"
 MAX_RESULT_SIZE_KEY = "anthropic/maxResultSizeChars"
 ALWAYS_LOAD_KEY = "anthropic/alwaysLoad"
 # the source repo accumulates an ignored .serena folder (memories, caches) whenever other tests run in it in place
@@ -58,8 +63,9 @@ class RouterHarness:
     ``a/.claude/worktrees/x`` and another one beside it in ``sib``. Each tree defines a function that names it.
     """
 
-    def __init__(self, tmp_path: Path, config: str | None = None) -> None:
+    def __init__(self, tmp_path: Path, config: str | None = None, launch_in: str = "parent") -> None:
         base = tmp_path.resolve()
+        self.launch_in = launch_in
         self.home = base / "serena_home"
         self.home.mkdir()
         if config is not None:
@@ -88,6 +94,8 @@ class RouterHarness:
 
         self.session: ClientSession | None = None
         self.router_pid = 0
+        self.roots: list[Path] | None = None
+        self.instructions: str | None = None
 
     def config_file(self) -> Path:
         return self.home / "serena_config.yml"
@@ -112,12 +120,39 @@ class RouterHarness:
                 "false",
             ],
             env={**os.environ, "SERENA_HOME": str(self.home)},
-            cwd=self.parent,
+            cwd=getattr(self, self.launch_in),
         )
-        async with stdio_client(parameters, errlog=open(os.devnull, "w")) as (read, write), ClientSession(read, write) as session:
-            await session.initialize()
+        async with (
+            stdio_client(parameters, errlog=open(os.devnull, "w")) as (read, write),
+            ClientSession(read, write, list_roots_callback=self._list_roots) as session,
+        ):
+            self.instructions = (await session.initialize()).instructions
             self.session = session
             yield self
+
+    async def _list_roots(self, _context: Any) -> ListRootsResult | ErrorData:
+        if self.roots is None:
+            return ErrorData(code=-32601, message="no roots")
+        return ListRootsResult(roots=[Root(uri=path.as_uri()) for path in self.roots])
+
+    async def change_roots(self, roots: list[Path]) -> None:
+        assert self.session is not None
+        self.roots = roots
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            await self.session.send_roots_list_changed()  # ty: ignore[deprecated]
+
+    def make_activation_marker(self, project: Path) -> Path:
+        """
+        Gives the project an ``activation_command`` that creates the returned file, which exists only if the project was
+        activated as a trusted one.
+        """
+        marker = project.parent / f"{project.name}.activated"
+        (project / ".serena").mkdir(exist_ok=True)
+        (project / ".serena" / "project.yml").write_text(
+            f"project_name: {project.name}\nlanguage_servers:\n- python\nactivation_command: touch {marker}\n"
+        )
+        return marker
 
     async def call_raw(self, tool: str, **arguments: Any) -> CallToolResult:
         assert self.session is not None
@@ -132,8 +167,15 @@ class RouterHarness:
         return self.text(result)
 
     @staticmethod
-    def text(result: CallToolResult) -> str:
-        return "".join(block.text for block in result.content if hasattr(block, "text"))
+    def blocks(result: CallToolResult) -> list[str]:
+        return [block.text for block in result.content if hasattr(block, "text")]
+
+    @classmethod
+    def text(cls, result: CallToolResult) -> str:
+        """
+        :return: the text of the child's own result, without the router's header and activation text
+        """
+        return "".join(block for block in cls.blocks(result) if not block.startswith((HEADER_PREFIX, ACTIVATION_PREFIX)))
 
     async def found(self, name: str, cwd: Path, **arguments: Any) -> list[dict[str, Any]]:
         text = await self.call("find_symbol", cwd, name_path_pattern=name, **arguments)
@@ -147,8 +189,10 @@ def paths_outside_worktrees(symbols: list[dict[str, Any]]) -> list[str]:
     return [s["relative_path"] for s in symbols if not s["relative_path"].startswith(".claude/")]
 
 
-def run_router(tmp_path: Path, scenario: Callable[[RouterHarness], Awaitable[T]], config: str | None = None) -> T:
-    harness = RouterHarness(tmp_path, config)
+def run_router(
+    tmp_path: Path, scenario: Callable[[RouterHarness], Awaitable[T]], config: str | None = None, launch_in: str = "parent"
+) -> T:
+    harness = RouterHarness(tmp_path, config, launch_in)
 
     async def main() -> T:
         async with harness.running():
@@ -423,3 +467,149 @@ def _cmdline(process: psutil.Process) -> list[str]:
         return process.cmdline()
     except (psutil.AccessDenied, psutil.NoSuchProcess):
         return []
+
+
+class TestTrust:
+    def test_a_project_outside_the_working_directories_runs_untrusted_until_the_roots_include_it(self, tmp_path: Path) -> None:
+        async def scenario(router: RouterHarness) -> tuple[list[bool], list[bool]]:
+            main_marker = router.make_activation_marker(router.main)
+            sibling_marker = router.make_activation_marker(router.sibling)
+            router.roots = [router.main]
+            sibling_file = str(router.sibling / SUBFOLDER / "sib_only_marker.py")
+            await router.found("main_only", router.main)
+            await router.call("find_symbol", router.main, name_path_pattern="sib_only", relative_path=sibling_file)
+            before = [main_marker.exists(), sibling_marker.exists()]
+            await router.change_roots([router.main, router.sibling])
+            await router.call("find_symbol", router.main, name_path_pattern="sib_only", relative_path=sibling_file)
+            return before, [main_marker.exists(), sibling_marker.exists()]
+
+        before, after = run_router(
+            tmp_path, scenario, config="projects: []\nlanguage_backend: LSP\ntrusted_project_path_patterns:\n- '**'\n"
+        )
+
+        assert before == [True, False]
+        assert after == [True, True]
+
+
+class TestActivationText:
+    def test_the_first_result_of_each_project_carries_its_activation_text_and_other_projects_are_named(self, tmp_path: Path) -> None:
+        async def scenario(router: RouterHarness) -> dict[str, list[str]]:
+            blocks = {}
+            blocks["a_first"] = router.blocks(await router.call_raw("list_memories", cwd=str(router.main)))
+            blocks["a_second"] = router.blocks(await router.call_raw("list_memories", cwd=str(router.main)))
+            blocks["b_first"] = router.blocks(await router.call_raw("list_memories", cwd=str(router.other)))
+            blocks["b_second"] = router.blocks(await router.call_raw("list_memories", cwd=str(router.other)))
+            return blocks
+
+        blocks = run_router(tmp_path, scenario, launch_in="main")
+        base = tmp_path.resolve() / "parent"
+
+        assert blocks["a_first"][0].startswith(ACTIVATION_PREFIX) and "project with name 'a'" in blocks["a_first"][0]
+        assert len(blocks["a_first"]) == 2 and not blocks["a_first"][1].startswith(HEADER_PREFIX)
+        assert len(blocks["a_second"]) == 1 and not blocks["a_second"][0].startswith((HEADER_PREFIX, ACTIVATION_PREFIX))
+        assert blocks["b_first"][0] == f"[serena project b at {base / 'b'}]"
+        assert blocks["b_first"][1].startswith(ACTIVATION_PREFIX) and "project with name 'b'" in blocks["b_first"][1]
+        assert len(blocks["b_second"]) == 2 and blocks["b_second"][0] == blocks["b_first"][0]
+
+    def test_initial_instructions_answers_for_the_project_of_cwd_and_counts_as_its_first_result(self, tmp_path: Path) -> None:
+        async def scenario(router: RouterHarness) -> tuple[list[str], list[str]]:
+            asked = router.blocks(await router.call_raw("initial_instructions", cwd=str(router.nested)))
+            then = router.blocks(await router.call_raw("list_memories", cwd=str(router.nested)))
+            return asked, then
+
+        asked, then = run_router(tmp_path, scenario, launch_in="main")
+
+        assert asked[0].startswith(HEADER_PREFIX) and "worktrees/x]" in asked[0]
+        assert len(asked) == 2 and asked[1].startswith(ACTIVATION_PREFIX) and "project with name 'x'" in asked[1]
+        assert len(then) == 2 and then[0] == asked[0] and not then[1].startswith(ACTIVATION_PREFIX)
+
+    def test_the_connection_prompt_names_cwd_and_parallel_calls_and_fits_the_limit(self, tmp_path: Path) -> None:
+        async def scenario(router: RouterHarness) -> str | None:
+            return router.instructions
+
+        instructions = run_router(tmp_path, scenario)
+
+        assert instructions is not None and len(instructions) < 4096
+        assert "required `cwd`" in instructions and "different projects may run in parallel" in instructions
+
+
+class TestCodeFileList:
+    def test_a_project_that_has_started_a_child_lists_the_extensions_of_its_language_servers(self, tmp_path: Path) -> None:
+        async def scenario(router: RouterHarness) -> None:
+            await router.call("list_memories", router.main)
+
+        run_router(tmp_path, scenario)
+        digest = hashlib.sha256(str(tmp_path.resolve() / "parent" / "a").encode()).hexdigest()[:16]
+        listing = tmp_path.resolve() / "serena_home" / "follow_cwd" / f"{digest}.code-files"
+
+        assert ".py" in listing.read_text().splitlines()
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.seconds = 0.0
+
+    def now(self) -> float:
+        return self.seconds
+
+
+def _running_children_of(*roots: Path) -> dict[Path, set[int]]:
+    return {root: {pid for pid in _child_pids(str(root)) if psutil.pid_exists(pid)} for root in roots}
+
+
+async def _gone(root: Path) -> bool:
+    for _ in range(100):
+        if not _child_pids(str(root)):
+            return True
+        await asyncio.sleep(0.1)
+    return False
+
+
+class TestLifecycle:
+    @staticmethod
+    def _target(root: Path) -> CallTarget:
+        return CallTarget(root=root, caller_dir=root)
+
+    def test_an_idle_child_stops_and_the_next_call_starts_a_new_one(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        harness = RouterHarness(tmp_path)
+        monkeypatch.setenv("SERENA_HOME", str(harness.home))
+        clock = FakeClock()
+
+        async def main() -> tuple[set[int], bool, bool, set[int]]:
+            async with ChildPool(ChildOptions(context="claude-code"), clock=clock, idle_timeout=3600) as pool:
+                await pool.forward(self._target(harness.main), "list_memories", {})
+                first = _child_pids(str(harness.main))
+                clock.seconds = 3599
+                pool.stop_idle_children()
+                still_running = _child_pids(str(harness.main)) == first
+                clock.seconds = 3600
+                pool.stop_idle_children()
+                stopped = await _gone(harness.main)
+                await pool.forward(self._target(harness.main), "list_memories", {})
+                return first, still_running, stopped, _child_pids(str(harness.main))
+
+        first, still_running, stopped, second = asyncio.run(asyncio.wait_for(main(), timeout=300))
+
+        assert first and still_running and stopped
+        assert second and not (second & first)
+
+    def test_beyond_the_cap_the_least_recently_used_child_stops_and_leaving_the_pool_stops_the_rest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        harness = RouterHarness(tmp_path)
+        monkeypatch.setenv("SERENA_HOME", str(harness.home))
+        clock = FakeClock()
+
+        async def main() -> tuple[dict[Path, set[int]], dict[Path, set[int]]]:
+            async with ChildPool(ChildOptions(context="claude-code"), clock=clock, max_children=2) as pool:
+                for root in (harness.main, harness.other, harness.main, harness.nested):
+                    clock.seconds += 1
+                    await pool.forward(self._target(root), "list_memories", {})
+                await _gone(harness.other)
+                during = _running_children_of(harness.main, harness.other, harness.nested)
+            return during, _running_children_of(harness.main, harness.other, harness.nested)
+
+        during, after = asyncio.run(asyncio.wait_for(main(), timeout=300))
+
+        assert bool(during[harness.main]) and bool(during[harness.nested]) and not during[harness.other]
+        assert not any(after.values())

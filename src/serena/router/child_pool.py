@@ -4,19 +4,22 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 from types import TracebackType
-from typing import Any
+from typing import Any, Protocol
 
 import anyio
 import anyio.abc
+from anyio import to_thread
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.shared.exceptions import MCPError
-from mcp_types import CONNECTION_CLOSED, CallToolResult
+from mcp_types import CONNECTION_CLOSED, CallToolResult, TextContent
 from sensai.util import logging
 
 from serena.router.call_target import CallTarget
+from serena.router.project_facts import ProjectFacts, ProjectInspector
 from serena.util.path_renderer import PathRenderer
 
 log = logging.getLogger(__name__)
@@ -38,9 +41,10 @@ class ChildOptions:
 
     _BOOTSTRAP = "from serena.cli import top_level; top_level()"
 
-    def command(self, root: Path) -> list[str]:
+    def command(self, root: Path, trusted: bool = True) -> list[str]:
         """
         :param root: the real path of the project root the child is launched on
+        :param trusted: whether the project may run project-defined programs; if not, the child is launched untrusted
         :return: the command line that starts a child Serena on the root, running on the router's own interpreter
             without the working directory on its module path
         """
@@ -67,6 +71,8 @@ class ChildOptions:
             "--enable-gui-log-window",
             "false",
         ]
+        if not trusted:
+            command.append("--untrusted")
         for mode in self.modes:
             command += ["--mode", mode]
         for mode in self.added_modes:
@@ -86,28 +92,67 @@ class ChildFailedError(ToolError):
     """
 
 
+class Clock(Protocol):
+    """
+    The source of time for the pool's idle stop.
+    """
+
+    def now(self) -> float:
+        """
+        :return: seconds, on a clock that never goes back
+        """
+        ...
+
+
+class MonotonicClock:
+    def now(self) -> float:
+        return monotonic()
+
+
+@dataclass(frozen=True)
+class ChildReply:
+    """
+    A child's answer to a call, with what the router knows about the child's project.
+    """
+
+    result: CallToolResult
+    project_name: str
+    activation_text: str
+
+
 class _ChildProcess:
     """
     One child Serena and its MCP client session. The process and the session live in a task of their own,
     since the transport's context must be exited by the task that entered it.
     """
 
-    def __init__(self, root: Path, options: ChildOptions):
+    INITIAL_INSTRUCTIONS_TOOL_NAME = "initial_instructions"
+
+    def __init__(self, root: Path, options: ChildOptions, trusted: bool, inspector: ProjectInspector | None, last_used: float):
         self.root = root
+        self.trusted = trusted
+        self.last_used = last_used
+        self.active_calls = 0
+        self.activation_text = ""
+        self.facts = ProjectFacts(name=root.name)
         self._options = options
+        self._inspector = inspector
         self._session: ClientSession | None = None
         self._ready = anyio.Event()
         self._stop = anyio.Event()
         self._failure: BaseException | None = None
 
     async def run(self) -> None:
-        argv = self._options.command(self.root)
+        argv = self._options.command(self.root, self.trusted)
         parameters = StdioServerParameters(command=argv[0], args=argv[1:], env=dict(os.environ), cwd=self.root)
         log.info("Starting child Serena for %s", self.root)
         try:
             async with stdio_client(parameters) as (read_stream, write_stream):
                 async with ClientSession(read_stream, write_stream) as session:
                     await session.initialize()
+                    self.activation_text = await self._fetch_activation_text(session)
+                    if self._inspector is not None:
+                        self.facts = await to_thread.run_sync(self._inspector.inspect, self.root)
                     self._session = session
                     self._ready.set()
                     await self._stop.wait()
@@ -119,6 +164,11 @@ class _ChildProcess:
             self._stop.set()
             self._ready.set()
             log.info("Child Serena for %s stopped", self.root)
+
+    @classmethod
+    async def _fetch_activation_text(cls, session: ClientSession) -> str:
+        result = await session.call_tool(cls.INITIAL_INSTRUCTIONS_TOOL_NAME, {})
+        return "".join(block.text for block in result.content if isinstance(block, TextContent))
 
     async def wait_until_ready(self) -> None:
         """
@@ -157,49 +207,130 @@ class _ChildProcess:
 class ChildPool:
     """
     The owner of all children: one per project root (by real path), started on first use, restarted on the
-    call after it died, and stopped together when the pool is left.
+    call after it died or after the project's trust changed, and stopped together when the pool is left.
+    A child idle for ``idle_timeout`` seconds stops, and at most ``max_children`` run: the least recently used
+    stops first.
 
     Use as an async context manager, entered and left by the same task.
     """
 
-    def __init__(self, options: ChildOptions):
+    DEFAULT_IDLE_TIMEOUT = 60 * 60.0
+    DEFAULT_MAX_CHILDREN = 8
+    DEFAULT_SWEEP_INTERVAL = 60.0
+
+    def __init__(
+        self,
+        options: ChildOptions,
+        inspector: ProjectInspector | None = None,
+        clock: Clock | None = None,
+        idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        max_children: int = DEFAULT_MAX_CHILDREN,
+        sweep_interval: float = DEFAULT_SWEEP_INTERVAL,
+    ):
+        """
+        :param options: the launch options of the children
+        :param inspector: reads each project's configuration when its child has started
+        :param clock: the source of time for the idle stop
+        :param idle_timeout: seconds after which an unused child stops
+        :param max_children: the number of children above which the least recently used one stops
+        :param sweep_interval: seconds between looks for idle children
+        """
         self._options = options
+        self._inspector = inspector
+        self._clock = clock or MonotonicClock()
+        self._idle_timeout = idle_timeout
+        self._max_children = max_children
+        self._sweep_interval = sweep_interval
         self._children: dict[Path, _ChildProcess] = {}
         self._start_locks: dict[Path, anyio.Lock] = {}
         self._task_group: anyio.abc.TaskGroup | None = None
+        self._closing = anyio.Event()
 
     async def __aenter__(self) -> "ChildPool":
         self._task_group = anyio.create_task_group()
         await self._task_group.__aenter__()
+        self._task_group.start_soon(self._sweep_periodically)
         return self
 
     async def __aexit__(
         self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None
     ) -> bool | None:
         assert self._task_group is not None
+        self._closing.set()
         for child in self._children.values():
             child.stop()
         return await self._task_group.__aexit__(exc_type, exc_value, traceback)
 
-    async def forward(self, target: CallTarget, tool_name: str, arguments: dict[str, Any]) -> CallToolResult:
+    async def forward(self, target: CallTarget, tool_name: str, arguments: dict[str, Any]) -> ChildReply:
         """
-        :param target: the project and caller folder of the call
+        :param target: the project, caller folder and trust of the call
         :param tool_name: the tool to call on the project's child
         :param arguments: the arguments of the tool, without ``cwd``
-        :return: the child's result, unchanged
+        :return: the child's result, unchanged, with what is known about its project
         :raises ChildFailedError: if the child cannot be started or its connection closes
         """
-        child = await self._running_child(target.root)
-        return await child.call_tool(tool_name, arguments, target.caller_dir)
+        child = await self._running_child(target)
+        child.active_calls += 1
+        try:
+            result = await child.call_tool(tool_name, arguments, target.caller_dir)
+        finally:
+            child.active_calls -= 1
+            child.last_used = self._clock.now()
+        return ChildReply(result, child.facts.name, child.activation_text)
 
-    async def _running_child(self, root: Path) -> _ChildProcess:
+    async def activation(self, target: CallTarget) -> ChildReply:
+        """
+        :return: the activation text of the target's project, without a call to the child (the result is empty)
+        :raises ChildFailedError: if the child cannot be started
+        """
+        child = await self._running_child(target)
+        child.last_used = self._clock.now()
+        return ChildReply(CallToolResult(content=[]), child.facts.name, child.activation_text)
+
+    def stop_idle_children(self) -> None:
+        """
+        Stops the children that no call has used for the idle timeout.
+        """
+        now = self._clock.now()
+        for root, child in list(self._children.items()):
+            if child.is_running and child.active_calls == 0 and now - child.last_used >= self._idle_timeout:
+                log.info("Stopping the idle child Serena for %s", root)
+                child.stop()
+                del self._children[root]
+
+    async def _sweep_periodically(self) -> None:
+        while not self._closing.is_set():
+            with anyio.move_on_after(self._sweep_interval):
+                await self._closing.wait()
+            self.stop_idle_children()
+
+    def _make_room_for_another_child(self) -> None:
+        running = {root: child for root, child in self._children.items() if child.is_running}
+        while len(running) >= self._max_children:
+            idle = [(child.last_used, root) for root, child in running.items() if child.active_calls == 0]
+            if not idle:
+                return
+            _, root = min(idle)
+            log.info("Stopping the least recently used child Serena for %s", root)
+            running.pop(root).stop()
+            del self._children[root]
+
+    async def _running_child(self, target: CallTarget) -> _ChildProcess:
+        root = target.root
         lock = self._start_locks.setdefault(root, anyio.Lock())
         async with lock:
             child = self._children.get(root)
+            if child is not None and child.is_running and child.trusted != target.trusted:
+                log.info("Restarting the child Serena for %s, as its trust changed to %s", root, target.trusted)
+                child.stop()
+                child = None
             if child is None or not child.is_running:
                 assert self._task_group is not None
-                child = _ChildProcess(root, self._options)
+                self._children.pop(root, None)
+                self._make_room_for_another_child()
+                child = _ChildProcess(root, self._options, target.trusted, self._inspector, self._clock.now())
                 self._children[root] = child
                 self._task_group.start_soon(child.run)
+            child.last_used = self._clock.now()
             await child.wait_until_ready()
             return child
