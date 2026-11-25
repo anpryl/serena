@@ -23,6 +23,21 @@ class ProjectFacts:
     name: str
 
 
+def write_atomically(path: Path, text: str) -> None:
+    """
+    Replaces the file with the text, so that a reader sees the old or the new content and never a part of it.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(descriptor, "w") as file:
+            file.write(text)
+        os.replace(temporary, path)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+
 class CodeFileList:
     """
     The file extensions that the language servers of a project handle, kept in a file under ``<SERENA_HOME>/follow_cwd``
@@ -47,15 +62,7 @@ class CodeFileList:
         """
         Writes the extensions one per line, replacing the file atomically.
         """
-        self._folder.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary = tempfile.mkstemp(dir=self._folder, suffix=".tmp")
-        try:
-            with os.fdopen(descriptor, "w") as file:
-                file.write("".join(f"{extension}\n" for extension in extensions))
-            os.replace(temporary, self.path_of(root))
-        except BaseException:
-            Path(temporary).unlink(missing_ok=True)
-            raise
+        write_atomically(self.path_of(root), "".join(f"{extension}\n" for extension in extensions))
 
 
 class ProjectInspector:

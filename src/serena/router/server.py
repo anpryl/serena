@@ -13,6 +13,7 @@ from serena.router.catalog import RouterToolCatalog
 from serena.router.child_pool import ChildOptions, ChildPool
 from serena.router.project_facts import ProjectInspector
 from serena.router.router import Router
+from serena.router.status_file import StatusFile
 from serena.router.working_directories import WorkingDirectories
 from serena.util.logging import MemoryLogHandler
 
@@ -60,7 +61,9 @@ class RouterMCPFactory(SerenaMCPFactory):
                 working_directories.invalidate()
 
             mcp_server._lowlevel_server.add_notification_handler("notifications/roots/list_changed", NotificationParams, on_roots_changed)
-            async with ChildPool(self._child_options, inspector=ProjectInspector(self.agent.serena_config)) as pool:
+            async with ChildPool(
+                self._child_options, inspector=ProjectInspector(self.agent.serena_config), status_file=StatusFile()
+            ) as pool:
                 catalog = RouterToolCatalog(
                     self.agent,
                     Router(pool, working_directories),

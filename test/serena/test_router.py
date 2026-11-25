@@ -25,6 +25,7 @@ from mcp_types import CallToolResult, ErrorData, ListRootsResult, Root
 
 from serena.router.call_target import CallTarget
 from serena.router.child_pool import ChildOptions, ChildPool
+from serena.router.status_file import StatusFile
 from solidlsp.ls_config import LanguageServerId
 from test.conftest import get_repo_path
 
@@ -613,3 +614,42 @@ class TestLifecycle:
 
         assert bool(during[harness.main]) and bool(during[harness.nested]) and not during[harness.other]
         assert not any(after.values())
+
+
+class TestStatusFile:
+    def test_the_file_reflects_a_start_a_ready_and_a_stop(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        harness = RouterHarness(tmp_path)
+        monkeypatch.setenv("SERENA_HOME", str(harness.home))
+        status_file = StatusFile(harness.home)
+        clock = FakeClock()
+
+        def children() -> list[dict[str, str]]:
+            return json.loads(status_file.path.read_text())["children"] if status_file.path.exists() else []
+
+        async def main() -> tuple[set[str], list[dict[str, str]], list[dict[str, str]], list[dict[str, str]]]:
+            seen: set[str] = set()
+            async with ChildPool(ChildOptions(context="claude-code"), clock=clock, idle_timeout=3600, status_file=status_file) as pool:
+
+                async def watch() -> None:
+                    while True:
+                        seen.update(child["state"] for child in children())
+                        await asyncio.sleep(0.005)
+
+                watcher = asyncio.create_task(watch())
+                await pool.forward(self._target(harness.main), "list_memories", {})
+                watcher.cancel()
+                after_call = children()
+                clock.seconds = 3600
+                pool.stop_idle_children()
+                after_stop = children()
+            return seen, after_call, after_stop, children()
+
+        seen, after_call, after_stop, after_exit = asyncio.run(asyncio.wait_for(main(), timeout=300))
+
+        assert seen == {"starting", "ready"}
+        assert after_call == [{"root": str(harness.main), "name": harness.main.name, "state": "idle"}]
+        assert after_stop == [] and after_exit == []
+
+    @staticmethod
+    def _target(root: Path) -> CallTarget:
+        return CallTarget(root=root, caller_dir=root)

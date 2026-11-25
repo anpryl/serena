@@ -2,6 +2,7 @@
 
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
@@ -20,6 +21,7 @@ from sensai.util import logging
 
 from serena.router.call_target import CallTarget
 from serena.router.project_facts import ProjectFacts, ProjectInspector
+from serena.router.status_file import ChildState, ChildStatus, StatusFile
 from serena.util.path_renderer import PathRenderer
 
 log = logging.getLogger(__name__)
@@ -128,7 +130,15 @@ class _ChildProcess:
 
     INITIAL_INSTRUCTIONS_TOOL_NAME = "initial_instructions"
 
-    def __init__(self, root: Path, options: ChildOptions, trusted: bool, inspector: ProjectInspector | None, last_used: float):
+    def __init__(
+        self,
+        root: Path,
+        options: ChildOptions,
+        trusted: bool,
+        inspector: ProjectInspector | None,
+        last_used: float,
+        on_change: Callable[[], None],
+    ):
         self.root = root
         self.trusted = trusted
         self.last_used = last_used
@@ -137,6 +147,7 @@ class _ChildProcess:
         self.facts = ProjectFacts(name=root.name)
         self._options = options
         self._inspector = inspector
+        self._on_change = on_change
         self._session: ClientSession | None = None
         self._ready = anyio.Event()
         self._stop = anyio.Event()
@@ -155,6 +166,7 @@ class _ChildProcess:
                         self.facts = await to_thread.run_sync(self._inspector.inspect, self.root)
                     self._session = session
                     self._ready.set()
+                    self._on_change()
                     await self._stop.wait()
         except Exception as e:
             log.error("Child Serena for %s failed: %s", self.root, e)
@@ -163,6 +175,7 @@ class _ChildProcess:
             self._session = None
             self._stop.set()
             self._ready.set()
+            self._on_change()
             log.info("Child Serena for %s stopped", self.root)
 
     @classmethod
@@ -200,8 +213,20 @@ class _ChildProcess:
             self.stop()
             raise ChildFailedError(f"The Serena child for {self.root} stopped answering: {e}") from e
 
+    @property
+    def state(self) -> ChildState | None:
+        """
+        :return: the child's state for the status file, or None once it has stopped
+        """
+        if self._stop.is_set():
+            return None
+        if self._session is None:
+            return ChildState.STARTING
+        return ChildState.READY if self.active_calls > 0 else ChildState.IDLE
+
     def stop(self) -> None:
         self._stop.set()
+        self._on_change()
 
 
 class ChildPool:
@@ -226,6 +251,7 @@ class ChildPool:
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
         max_children: int = DEFAULT_MAX_CHILDREN,
         sweep_interval: float = DEFAULT_SWEEP_INTERVAL,
+        status_file: StatusFile | None = None,
     ):
         """
         :param options: the launch options of the children
@@ -234,6 +260,7 @@ class ChildPool:
         :param idle_timeout: seconds after which an unused child stops
         :param max_children: the number of children above which the least recently used one stops
         :param sweep_interval: seconds between looks for idle children
+        :param status_file: where the children and their states are published on every start, ready, stop and idle change
         """
         self._options = options
         self._inspector = inspector
@@ -241,6 +268,7 @@ class ChildPool:
         self._idle_timeout = idle_timeout
         self._max_children = max_children
         self._sweep_interval = sweep_interval
+        self._status_file = status_file
         self._children: dict[Path, _ChildProcess] = {}
         self._start_locks: dict[Path, anyio.Lock] = {}
         self._task_group: anyio.abc.TaskGroup | None = None
@@ -270,12 +298,10 @@ class ChildPool:
         :raises ChildFailedError: if the child cannot be started or its connection closes
         """
         child = await self._running_child(target)
-        child.active_calls += 1
         try:
             result = await child.call_tool(tool_name, arguments, target.caller_dir)
         finally:
-            child.active_calls -= 1
-            child.last_used = self._clock.now()
+            self._release(child)
         return ChildReply(result, child.facts.name, child.activation_text)
 
     async def activation(self, target: CallTarget) -> ChildReply:
@@ -284,8 +310,24 @@ class ChildPool:
         :raises ChildFailedError: if the child cannot be started
         """
         child = await self._running_child(target)
-        child.last_used = self._clock.now()
+        self._release(child)
         return ChildReply(CallToolResult(content=[]), child.facts.name, child.activation_text)
+
+    def _release(self, child: _ChildProcess) -> None:
+        child.active_calls -= 1
+        child.last_used = self._clock.now()
+        self._publish()
+
+    def _publish(self) -> None:
+        if self._status_file is None:
+            return
+        statuses = [
+            ChildStatus(root, child.facts.name, state) for root, child in self._children.items() if (state := child.state) is not None
+        ]
+        try:
+            self._status_file.write(statuses)
+        except OSError as e:
+            log.warning("Cannot write the status file %s: %s", self._status_file.path, e)
 
     def stop_idle_children(self) -> None:
         """
@@ -328,9 +370,17 @@ class ChildPool:
                 assert self._task_group is not None
                 self._children.pop(root, None)
                 self._make_room_for_another_child()
-                child = _ChildProcess(root, self._options, target.trusted, self._inspector, self._clock.now())
+                child = _ChildProcess(root, self._options, target.trusted, self._inspector, self._clock.now(), self._publish)
                 self._children[root] = child
+                self._publish()
                 self._task_group.start_soon(child.run)
             child.last_used = self._clock.now()
-            await child.wait_until_ready()
+            # claimed before the wait, so that a child which comes up for a call is ready and never idle in between
+            child.active_calls += 1
+            try:
+                await child.wait_until_ready()
+            except BaseException:
+                self._release(child)
+                raise
+            self._publish()
             return child
