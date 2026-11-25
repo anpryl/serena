@@ -4,7 +4,9 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
+import anyio
 from mcp.server.mcpserver import MCPServer as FastMCP
 from mcp_types import NotificationParams
 from sensai.util import logging
@@ -15,7 +17,7 @@ from serena.router.child_pool import ChildOptions, ChildPool
 from serena.router.project_facts import ProjectInspector
 from serena.router.router import Router
 from serena.router.status_file import StatusFile
-from serena.router.working_directories import WorkingDirectories
+from serena.router.working_directories import ClientRoots, WorkingDirectories
 from serena.util.logging import MemoryLogHandler
 from serena.util.project_root import find_project_root
 
@@ -65,12 +67,20 @@ class RouterMCPFactory(SerenaMCPFactory):
                 working_directories.invalidate()
 
             mcp_server._lowlevel_server.add_notification_handler("notifications/roots/list_changed", NotificationParams, on_roots_changed)
-            async with ChildPool(
-                self._child_options, inspector=ProjectInspector(self.agent.serena_config), status_file=status_file
-            ) as pool:
+            async with (
+                ChildPool(self._child_options, inspector=ProjectInspector(self.agent.serena_config), status_file=status_file) as pool,
+                anyio.create_task_group() as eager_starts,
+            ):
+                router = Router(pool, working_directories)
+
+                async def on_initialized(context: Any, _: object) -> None:
+                    # in a task of its own: asking the client for its roots needs the receive loop that runs this handler
+                    eager_starts.start_soon(router.start_launch_child, ClientRoots(context.session))
+
+                mcp_server._lowlevel_server.add_notification_handler("notifications/initialized", NotificationParams, on_initialized)
                 catalog = RouterToolCatalog(
                     self.agent,
-                    Router(pool, working_directories),
+                    router,
                     openai_tool_compatible=False,
                     structured_output=self.agent.get_context().structured_tool_output,
                 )
@@ -78,5 +88,6 @@ class RouterMCPFactory(SerenaMCPFactory):
                 mcp_server._tool_manager._tools = dict(tools)
                 log.info("Starting router MCP server with %d tools: %s", len(tools), list(tools))
                 yield
+                eager_starts.cancel_scope.cancel()
         finally:
             self.shutdown_agent()

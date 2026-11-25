@@ -25,7 +25,9 @@ from mcp_types import CallToolResult, ErrorData, ListRootsResult, Root
 
 from serena.router.call_target import CallTarget
 from serena.router.child_pool import ChildOptions, ChildPool
+from serena.router.router import Router
 from serena.router.status_file import StatusFile
+from serena.router.working_directories import WorkingDirectories
 from solidlsp.ls_config import LanguageServerId
 from test.conftest import get_repo_path
 
@@ -614,6 +616,63 @@ class TestLifecycle:
 
         assert bool(during[harness.main]) and bool(during[harness.nested]) and not during[harness.other]
         assert not any(after.values())
+
+
+class TestEagerStart:
+    def test_the_launch_root_has_a_child_and_a_code_file_list_after_connect_and_before_any_call(self, tmp_path: Path) -> None:
+        async def scenario(router: RouterHarness) -> tuple[list[str], list[dict[str, Any]]]:
+            listing = router.home / "follow_cwd" / f"{hashlib.sha256(str(router.main).encode()).hexdigest()[:16]}.code-files"
+
+            def wait_for_listing() -> None:
+                deadline = time.monotonic() + 120
+                while not listing.exists() and time.monotonic() < deadline:
+                    time.sleep(0.1)
+
+            await asyncio.to_thread(wait_for_listing)
+            states = list((router.home / "follow_cwd" / "state").glob("*.json"))
+            return listing.read_text().splitlines() if listing.exists() else [], [
+                child for state in states for child in json.loads(state.read_text())["children"]
+            ]
+
+        extensions, children = run_router(tmp_path, scenario, launch_in="main")
+
+        assert ".py" in extensions
+        assert [child["root"] for child in children] == [str(tmp_path.resolve() / "parent" / "a")]
+
+    def test_a_launch_folder_in_no_project_starts_nothing(self) -> None:
+        pool = _RecordingPool()
+        router = Router(pool, WorkingDirectories(Path("/")), launch_dir=Path("/"))
+
+        asyncio.run(router.start_launch_child(_NoRoots()))
+
+        assert pool.targets == []
+
+    def test_a_failed_start_is_not_raised_and_the_next_start_is_tried(self, tmp_path: Path) -> None:
+        (tmp_path / ".git").mkdir()
+        pool = _RecordingPool(fail_first=True)
+        router = Router(pool, WorkingDirectories(tmp_path), launch_dir=tmp_path)
+
+        asyncio.run(router.start_launch_child(_NoRoots()))
+        asyncio.run(router.start_launch_child(_NoRoots()))
+
+        assert [target.root for target in pool.targets] == [tmp_path.resolve()] * 2
+        assert all(target.trusted for target in pool.targets)
+
+
+class _NoRoots:
+    async def list_roots(self) -> list[Path] | None:
+        return None
+
+
+class _RecordingPool:
+    def __init__(self, fail_first: bool = False) -> None:
+        self.targets: list[CallTarget] = []
+        self._fail_first = fail_first
+
+    async def activation(self, target: CallTarget) -> None:
+        self.targets.append(target)
+        if self._fail_first and len(self.targets) == 1:
+            raise RuntimeError("no child")
 
 
 class TestStatusFile:

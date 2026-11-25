@@ -7,12 +7,15 @@ from typing import Any
 
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import CallToolResult, ContentBlock, TextContent
+from sensai.util import logging
 
 from serena.router.call_target import CallRefusedError, CallTarget, CallTargetResolver
 from serena.router.child_pool import ChildPool, ChildReply
 from serena.router.result_cap import ResultCap
 from serena.router.working_directories import RootsSource, WorkingDirectories
 from serena.util.project_root import find_project_root
+
+log = logging.getLogger(__name__)
 
 
 class Router:
@@ -45,6 +48,22 @@ class Router:
         self._resolver = resolver or CallTargetResolver()
         self._result_cap = result_cap or ResultCap()
         self._projects_with_activation_text: set[Path] = set()
+
+    async def start_launch_child(self, client_roots: RootsSource) -> None:
+        """
+        Starts the child of the launch folder's project, so that its code-file list exists before the first call.
+        Does nothing when the launch folder is in no project. A failure is logged and never raised: the first call
+        to the project starts the child again.
+
+        :param client_roots: where to ask for the client's roots, which decide the trust of the project
+        """
+        if self._launch_root is None:
+            return
+        try:
+            trusted = await self._working_directories.covers(self._launch_root, client_roots)
+            await self._pool.activation(CallTarget(root=self._launch_root, caller_dir=self._launch_root, trusted=trusted))
+        except Exception as e:
+            log.warning("Could not start the child Serena for the launch folder %s ahead of the first call: %s", self._launch_root, e)
 
     async def route(self, tool_name: str, arguments: dict[str, Any], client_roots: RootsSource) -> CallToolResult:
         """
