@@ -48,7 +48,7 @@ from serena.prompt_factory import SerenaPromptFactory
 from serena.tools import ActivateProjectTool
 from serena.util.cli_util import AutoRegisteringGroup
 from serena.util.logging import MemoryLogHandler
-from serena.util.project_root import find_project_root
+from serena.util.project_root import find_project_root, no_project_root_message
 from solidlsp.ls_config import LanguageServerIdLike, LanguageServerRegistry
 from solidlsp.ls_types import SymbolKind
 from solidlsp.util.subprocess_util import subprocess_kwargs
@@ -385,6 +385,13 @@ class TopLevelCommands(AutoRegisteringGroup):
         help="Auto-detect project from current working directory (nearest ancestor containing .serena/project.yml or .git). If none is found, no project is activated. Intended for CLI-based agents like Claude Code, Gemini and Codex.",
     )
     @click.option(
+        "--follow-cwd",
+        is_flag=True,
+        default=False,
+        help="Start a router that holds no project and sends each tool call, which takes a required `cwd` argument, to a child "
+        "Serena launched on the project root of that folder. Intended for Claude Code; cannot be combined with a project.",
+    )
+    @click.option(
         "--project-registry",
         type=bool,
         is_flag=False,
@@ -409,6 +416,7 @@ class TopLevelCommands(AutoRegisteringGroup):
         project: str | None,
         project_file_arg: str | None,
         project_from_cwd: bool | None,
+        follow_cwd: bool,
         context: str,
         default_modes: Sequence[str],
         added_modes: Sequence[str],
@@ -449,6 +457,13 @@ class TopLevelCommands(AutoRegisteringGroup):
         log.info("Initializing Serena MCP server")
         log.info("Storing logs in %s", log_path)
 
+        if follow_cwd:
+            if project is not None or project_file_arg is not None or project_from_cwd:
+                raise click.UsageError("--follow-cwd cannot be used with --project, --project-from-cwd or a positional project argument")
+            if transport != "stdio":
+                raise click.UsageError("--follow-cwd requires the stdio transport")
+            project_registry, read_only_config, agent_interface = False, True, AgentInterface.TOOLS.value
+
         # Handle --project-from-cwd flag
         project_activation_error: str | None = None
         if project_from_cwd:
@@ -459,8 +474,7 @@ class TopLevelCommands(AutoRegisteringGroup):
                 log.info("Auto-detected project root: %s", project)
             else:
                 project_activation_error = (
-                    f"No project root found from cwd={os.getcwd()} (no .serena/project.yml or .git found); "
-                    "no project activated. If the folder is a coding project folder to be worked on, "
+                    f"{no_project_root_message(os.getcwd())} If the folder is a coding project folder to be worked on, "
                     f"activate the folder explicitly using the {ActivateProjectTool.get_name_from_cls()} tool."
                 )
                 log.warning(project_activation_error)
@@ -471,7 +485,22 @@ class TopLevelCommands(AutoRegisteringGroup):
         if default_modes or added_modes:
             mode_selection_def = ModeSelectionDefinitionWithAddedModes(default_modes=default_modes or None, added_modes=added_modes or None)
 
-        factory = SerenaMCPFactory(transport=transport, context=context, project=project_file, memory_log_handler=memory_log_handler)
+        factory: SerenaMCPFactory
+        if follow_cwd:
+            from serena.router.child_pool import ChildOptions
+            from serena.router.server import RouterMCPFactory
+
+            child_options = ChildOptions(
+                context=context,
+                modes=tuple(default_modes),
+                added_modes=tuple(added_modes),
+                language_backend=language_backend,
+                tool_timeout=tool_timeout,
+                log_level=log_level,
+            )
+            factory = RouterMCPFactory(context=context, child_options=child_options, memory_log_handler=memory_log_handler)
+        else:
+            factory = SerenaMCPFactory(transport=transport, context=context, project=project_file, memory_log_handler=memory_log_handler)
         server = factory.create_mcp_server(
             mode_selection_def=mode_selection_def,
             language_backend=LanguageBackendRegistry.get_instance().resolve(language_backend) if language_backend else None,
