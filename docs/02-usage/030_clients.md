@@ -305,7 +305,7 @@ every working directory, which a call reaches by an absolute path or a `cwd` els
 worktree), runs in Serena's [untrusted mode](trusted-projects-config). Its `activation_command` and its
 project-level `ls_specific_settings` are ignored. A setting that such a project needs, such as `ls_path`, must go in
 the global `serena_config.yml`. The router reads the working directories from the client's MCP roots. Without
-roots, only the launch folder counts.
+roots, only the launch folder counts. With `--untrusted` on the router, every child runs untrusted.
 
 **One language server per language.** Claude Code's code-intelligence plugins start their own language server for
 each language they support. For a language that Serena also serves, two servers then run, which costs memory and

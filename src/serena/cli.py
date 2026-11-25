@@ -506,6 +506,7 @@ class TopLevelCommands(AutoRegisteringGroup):
                 language_backend=language_backend,
                 tool_timeout=tool_timeout,
                 log_level=log_level,
+                untrusted=untrusted,
             )
             factory = RouterMCPFactory(context=context, child_options=child_options, memory_log_handler=memory_log_handler)
         else:

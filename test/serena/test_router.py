@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 import warnings
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, TypeVar
@@ -66,9 +66,10 @@ class RouterHarness:
     ``a/.claude/worktrees/x`` and another one beside it in ``sib``. Each tree defines a function that names it.
     """
 
-    def __init__(self, tmp_path: Path, config: str | None = None, launch_in: str = "parent") -> None:
+    def __init__(self, tmp_path: Path, config: str | None = None, launch_in: str = "parent", extra_args: Sequence[str] = ()) -> None:
         base = tmp_path.resolve()
         self.launch_in = launch_in
+        self.extra_args = list(extra_args)
         self.home = base / "serena_home"
         self.home.mkdir()
         if config is not None:
@@ -121,6 +122,7 @@ class RouterHarness:
                 "false",
                 "--enable-gui-log-window",
                 "false",
+                *self.extra_args,
             ],
             env={**os.environ, "SERENA_HOME": str(self.home)},
             cwd=getattr(self, self.launch_in),
@@ -193,9 +195,13 @@ def paths_outside_worktrees(symbols: list[dict[str, Any]]) -> list[str]:
 
 
 def run_router(
-    tmp_path: Path, scenario: Callable[[RouterHarness], Awaitable[T]], config: str | None = None, launch_in: str = "parent"
+    tmp_path: Path,
+    scenario: Callable[[RouterHarness], Awaitable[T]],
+    config: str | None = None,
+    launch_in: str = "parent",
+    extra_args: Sequence[str] = (),
 ) -> T:
-    harness = RouterHarness(tmp_path, config, launch_in)
+    harness = RouterHarness(tmp_path, config, launch_in, extra_args)
 
     async def main() -> T:
         async with harness.running():
@@ -492,6 +498,22 @@ class TestTrust:
 
         assert before == [True, False]
         assert after == [True, True]
+
+    def test_the_routers_untrusted_option_makes_every_child_untrusted(self, tmp_path: Path) -> None:
+        async def scenario(router: RouterHarness) -> bool:
+            main_marker = router.make_activation_marker(router.main)
+            router.roots = [router.main]
+            await router.found("main_only", router.main)
+            return main_marker.exists()
+
+        marker_exists = run_router(
+            tmp_path,
+            scenario,
+            config="projects: []\nlanguage_backend: LSP\ntrusted_project_path_patterns:\n- '**'\n",
+            extra_args=["--untrusted"],
+        )
+
+        assert not marker_exists
 
 
 class TestActivationText:

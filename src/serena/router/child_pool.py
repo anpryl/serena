@@ -40,6 +40,8 @@ class ChildOptions:
     language_backend: str | None = None
     tool_timeout: float | None = None
     log_level: str | None = None
+    untrusted: bool = False
+    """whether every child runs untrusted, whatever its project's trust (the router's own ``--untrusted``)"""
 
     _BOOTSTRAP = "from serena.cli import top_level; top_level()"
 
@@ -73,7 +75,7 @@ class ChildOptions:
             "--enable-gui-log-window",
             "false",
         ]
-        if not trusted:
+        if self.untrusted or not trusted:
             command.append("--untrusted")
         for mode in self.modes:
             command += ["--mode", mode]
