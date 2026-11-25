@@ -22,7 +22,8 @@ class RouterTool(SerenaFastMCPTool):
     """
 
     CWD_DESCRIPTION: ClassVar[str] = (
-        "Your current working directory, absolute. Serena works as if launched there. After `cd`, pass the new folder."
+        "Your current working directory, absolute. Serena works as if launched there. After `cd`, pass the new folder. "
+        "Relative paths in other arguments stay relative to the project root, not to `cwd`."
     )
 
     def __init__(self, tool: Tool, router: Router, meta: dict[str, Any], openai_tool_compatible: bool, structured_output: bool | None):
