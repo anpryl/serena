@@ -287,7 +287,11 @@ class ChildPool:
         self._closing.set()
         for child in self._children.values():
             child.stop()
-        return await self._task_group.__aexit__(exc_type, exc_value, traceback)
+        try:
+            return await self._task_group.__aexit__(exc_type, exc_value, traceback)
+        finally:
+            if self._status_file is not None:
+                self._status_file.remove()
 
     async def forward(self, target: CallTarget, tool_name: str, arguments: dict[str, Any]) -> ChildReply:
         """

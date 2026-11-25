@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -16,6 +17,7 @@ from serena.router.router import Router
 from serena.router.status_file import StatusFile
 from serena.router.working_directories import WorkingDirectories
 from serena.util.logging import MemoryLogHandler
+from serena.util.project_root import find_project_root
 
 log = logging.getLogger(__name__)
 
@@ -55,14 +57,16 @@ class RouterMCPFactory(SerenaMCPFactory):
     async def server_lifespan(self, mcp_server: FastMCP) -> AsyncIterator[None]:
         assert self.agent is not None
         try:
-            working_directories = WorkingDirectories(Path.cwd())
+            launch_dir = Path.cwd()
+            working_directories = WorkingDirectories(launch_dir)
+            status_file = StatusFile(Path(os.path.realpath(find_project_root(start=launch_dir) or launch_dir)))
 
             async def on_roots_changed(*_: object) -> None:
                 working_directories.invalidate()
 
             mcp_server._lowlevel_server.add_notification_handler("notifications/roots/list_changed", NotificationParams, on_roots_changed)
             async with ChildPool(
-                self._child_options, inspector=ProjectInspector(self.agent.serena_config), status_file=StatusFile()
+                self._child_options, inspector=ProjectInspector(self.agent.serena_config), status_file=status_file
             ) as pool:
                 catalog = RouterToolCatalog(
                     self.agent,

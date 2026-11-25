@@ -617,38 +617,63 @@ class TestLifecycle:
 
 
 class TestStatusFile:
-    def test_the_file_reflects_a_start_a_ready_and_a_stop(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_the_file_is_named_by_the_pid_and_reflects_a_start_a_ready_and_a_stop(self, tmp_path: Path) -> None:
         harness = RouterHarness(tmp_path)
-        monkeypatch.setenv("SERENA_HOME", str(harness.home))
-        status_file = StatusFile(harness.home)
+        status_file = StatusFile(harness.main, harness.home, pid=4242)
         clock = FakeClock()
 
-        def children() -> list[dict[str, str]]:
-            return json.loads(status_file.path.read_text())["children"] if status_file.path.exists() else []
+        def content() -> dict[str, Any]:
+            return json.loads(status_file.path.read_text()) if status_file.path.exists() else {}
 
-        async def main() -> tuple[set[str], list[dict[str, str]], list[dict[str, str]], list[dict[str, str]]]:
+        async def main() -> tuple[set[str], dict[str, Any], dict[str, Any]]:
             seen: set[str] = set()
             async with ChildPool(ChildOptions(context="claude-code"), clock=clock, idle_timeout=3600, status_file=status_file) as pool:
 
                 async def watch() -> None:
                     while True:
-                        seen.update(child["state"] for child in children())
+                        seen.update(child["state"] for child in content().get("children", []))
                         await asyncio.sleep(0.005)
 
                 watcher = asyncio.create_task(watch())
                 await pool.forward(self._target(harness.main), "list_memories", {})
                 watcher.cancel()
-                after_call = children()
+                after_call = content()
                 clock.seconds = 3600
                 pool.stop_idle_children()
-                after_stop = children()
-            return seen, after_call, after_stop, children()
+                after_stop = content()
+            return seen, after_call, after_stop
 
-        seen, after_call, after_stop, after_exit = asyncio.run(asyncio.wait_for(main(), timeout=300))
+        seen, after_call, after_stop = asyncio.run(asyncio.wait_for(main(), timeout=300))
 
+        assert status_file.path == harness.home / "follow_cwd" / "state" / "4242.json"
         assert seen == {"starting", "ready"}
-        assert after_call == [{"root": str(harness.main), "name": harness.main.name, "state": "idle"}]
-        assert after_stop == [] and after_exit == []
+        assert after_call == {
+            "pid": 4242,
+            "launch_root": str(harness.main),
+            "children": [{"root": str(harness.main), "name": harness.main.name, "state": "idle"}],
+        }
+        assert after_stop == {"pid": 4242, "launch_root": str(harness.main), "children": []}
+        assert not status_file.path.exists()
+
+    def test_two_pools_keep_separate_files(self, tmp_path: Path) -> None:
+        harness = RouterHarness(tmp_path)
+        first = StatusFile(harness.main, harness.home, pid=1)
+        second = StatusFile(harness.other, harness.home, pid=2)
+
+        async def main() -> tuple[dict[str, Any], dict[str, Any]]:
+            options = ChildOptions(context="claude-code")
+            async with ChildPool(options, status_file=first) as first_pool, ChildPool(options, status_file=second) as second_pool:
+                await first_pool.forward(self._target(harness.main), "list_memories", {})
+                await second_pool.forward(self._target(harness.other), "list_memories", {})
+                return json.loads(first.path.read_text()), json.loads(second.path.read_text())
+
+        first_content, second_content = asyncio.run(asyncio.wait_for(main(), timeout=300))
+
+        assert first_content["launch_root"] == str(harness.main)
+        assert [child["root"] for child in first_content["children"]] == [str(harness.main)]
+        assert second_content["launch_root"] == str(harness.other)
+        assert [child["root"] for child in second_content["children"]] == [str(harness.other)]
+        assert not first.path.exists() and not second.path.exists()
 
     @staticmethod
     def _target(root: Path) -> CallTarget:
