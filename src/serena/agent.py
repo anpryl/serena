@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from logging import Logger
-from typing import TYPE_CHECKING, Optional, TypeVar, cast
+from typing import TYPE_CHECKING, ClassVar, Optional, TypeVar, cast
 
 import requests
 import webview
@@ -588,6 +588,12 @@ class DashboardManager:
 
 
 class SerenaAgent:
+    SINGLE_PROJECT_EXCLUDED_TOOL_NAMES: ClassVar[tuple[str, ...]] = (
+        ActivateProjectTool.get_name_from_cls(),
+        GetCurrentConfigTool.get_name_from_cls(),
+    )
+    """the tools that a single-project session does not expose"""
+
     def __init__(
         self,
         project: str | None = None,
@@ -891,7 +897,7 @@ class SerenaAgent:
             tool_inclusion_definitions.append(
                 NamedToolInclusionDefinition(
                     name="SingleProjectExclusions",
-                    excluded_tools=[ActivateProjectTool.get_name_from_cls(), GetCurrentConfigTool.get_name_from_cls()],
+                    excluded_tools=list(cls.SINGLE_PROJECT_EXCLUDED_TOOL_NAMES),
                 )
             )
             tool_inclusion_definitions.append(project.project_config)

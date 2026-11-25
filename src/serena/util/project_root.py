@@ -4,8 +4,8 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-def find_project_root(root: str | Path | None = None) -> str | None:
-    """Find project root by walking up from CWD.
+def find_project_root(root: str | Path | None = None, start: str | Path | None = None) -> str | None:
+    """Find project root by walking up from CWD (or from ``start``).
 
     Returns the nearest ancestor that is either an explicit Serena project
     (contains .serena/project.yml) or a git root (contains .git, which may be a
@@ -20,9 +20,11 @@ def find_project_root(root: str | Path | None = None) -> str | None:
 
     :param root: If provided, constrains the search to this directory and below
                  (acts as a virtual filesystem root). Search stops at this boundary.
+    :param start: The folder from which to walk up; defaults to the current working directory.
+                  It need not exist.
     :return: absolute path to project root or None if not suitable root is found
     """
-    current = Path.cwd().resolve()
+    current = Path(start).resolve() if start is not None else Path.cwd().resolve()
     boundary = Path(root).resolve() if root is not None else None
 
     def ancestors() -> Iterator[Path]:
@@ -42,3 +44,11 @@ def find_project_root(root: str | Path | None = None) -> str | None:
             return str(directory)
 
     return None
+
+
+def no_project_root_message(folder: str | Path) -> str:
+    """
+    :param folder: the folder from which no project root was found
+    :return: the message that reports the missing project root, naming the folder
+    """
+    return f"No project root found from cwd={folder} (no .serena/project.yml or .git found); no project activated."

@@ -169,3 +169,19 @@ class PathRenderer:
         if isinstance(occurrence_ids, list):
             parsed[self.OCCURRENCE_IDS_PARAMETER_NAME] = [self.parse_occurrence_id(i) if isinstance(i, str) else i for i in occurrence_ids]
         return parsed
+
+    @classmethod
+    def absolute_paths_in(cls, arguments: Mapping[str, Any]) -> list[str]:
+        """
+        :param arguments: the arguments of a tool call
+        :return: every absolute path among the path arguments and the occurrence ids, in argument order
+        """
+        paths: list[str] = []
+        for name in cls.PATH_PARAMETER_NAMES:
+            value = arguments.get(name)
+            if isinstance(value, str):
+                paths.append(value)
+        occurrence_ids = arguments.get(cls.OCCURRENCE_IDS_PARAMETER_NAME)
+        if isinstance(occurrence_ids, list):
+            paths.extend(i.rpartition(":")[0] for i in occurrence_ids if isinstance(i, str))
+        return [path for path in paths if os.path.isabs(path)]
