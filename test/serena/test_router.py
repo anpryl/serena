@@ -41,6 +41,11 @@ HEADER_PREFIX = "[serena project "
 ACTIVATION_PREFIX = "<serena>"
 MAX_RESULT_SIZE_KEY = "anthropic/maxResultSizeChars"
 ALWAYS_LOAD_KEY = "anthropic/alwaysLoad"
+CLAUDE_CODE_META = {
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientInfo": {"name": "claude-code", "title": "Claude Code", "version": "2.1.328"},
+    "io.modelcontextprotocol/clientCapabilities": {"roots": {"listChanged": True}, "elicitation": {"form": {}, "url": {}}},
+}
 # the source repo accumulates an ignored .serena folder (memories, caches) whenever other tests run in it in place
 _COPY_IGNORE = shutil.ignore_patterns(".serena", "__pycache__")
 
@@ -106,7 +111,73 @@ class RouterHarness:
 
     @asynccontextmanager
     async def running(self) -> AsyncIterator["RouterHarness"]:
-        parameters = StdioServerParameters(
+        async with (
+            stdio_client(self._server_parameters(), errlog=open(os.devnull, "w")) as (read, write),
+            ClientSession(read, write, list_roots_callback=self._list_roots) as session,
+        ):
+            self.instructions = (await session.initialize()).instructions
+            self.session = session
+            yield self
+
+    @asynccontextmanager
+    async def opened_by_claude_code(self) -> AsyncIterator["RouterHarness"]:
+        """
+        Starts the router and opens the connection over raw stdio with the requests Claude Code 2.1.328 sends: protocol
+        2026-07-28 named in each request's ``_meta``, with no ``initialize`` and no ``notifications/initialized``.
+        Enters once the tool list is answered, without calling a tool.
+        """
+        parameters = self._server_parameters()
+        process = await asyncio.create_subprocess_exec(
+            parameters.command,
+            *parameters.args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=parameters.env,
+            cwd=parameters.cwd,
+            limit=2**24,
+        )
+        assert process.stdin is not None and process.stdout is not None
+        stdin, stdout = process.stdin, process.stdout
+
+        async def request(request_id: str | int, method: str, **params: Any) -> None:
+            message = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": {"_meta": CLAUDE_CODE_META, **params}}
+            stdin.write(json.dumps(message).encode() + b"\n")
+            await stdin.drain()
+
+        async def response_to(request_id: str | int) -> dict[str, Any]:
+            while True:
+                line = await stdout.readline()
+                assert line, "the router closed its output"
+                message = json.loads(line)
+                if message.get("id") == request_id:
+                    assert "result" in message, message
+                    return message
+
+        try:
+            await request("server-discover-probe-1", "server/discover")
+            await response_to("server-discover-probe-1")
+            await request(
+                "listen:0",
+                "subscriptions/listen",
+                notifications={"toolsListChanged": True, "promptsListChanged": True, "resourcesListChanged": True},
+            )
+            await request(0, "server/discover")
+            await request(1, "prompts/list")
+            await request(2, "resources/list")
+            await request(3, "tools/list")
+            await response_to(3)
+            yield self
+        finally:
+            stdin.close()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=60)
+            except TimeoutError:
+                process.kill()
+                await process.wait()
+
+    def _server_parameters(self) -> StdioServerParameters:
+        return StdioServerParameters(
             command=sys.executable,
             args=[
                 "-P",
@@ -127,13 +198,6 @@ class RouterHarness:
             env={**os.environ, "SERENA_HOME": str(self.home)},
             cwd=getattr(self, self.launch_in),
         )
-        async with (
-            stdio_client(parameters, errlog=open(os.devnull, "w")) as (read, write),
-            ClientSession(read, write, list_roots_callback=self._list_roots) as session,
-        ):
-            self.instructions = (await session.initialize()).instructions
-            self.session = session
-            yield self
 
     async def _list_roots(self, _context: Any) -> ListRootsResult | ErrorData:
         if self.roots is None:
@@ -641,22 +705,24 @@ class TestLifecycle:
 
 
 class TestEagerStart:
-    def test_the_launch_root_has_a_child_and_a_code_file_list_after_connect_and_before_any_call(self, tmp_path: Path) -> None:
-        async def scenario(router: RouterHarness) -> tuple[list[str], list[dict[str, Any]]]:
-            listing = router.home / "follow_cwd" / f"{hashlib.sha256(str(router.main).encode()).hexdigest()[:16]}.code-files"
+    def test_the_launch_root_has_a_child_and_a_code_file_list_after_claude_code_connects_and_before_any_call(self, tmp_path: Path) -> None:
+        harness = RouterHarness(tmp_path, launch_in="main")
+        listing = harness.home / "follow_cwd" / f"{hashlib.sha256(str(harness.main).encode()).hexdigest()[:16]}.code-files"
 
-            def wait_for_listing() -> None:
-                deadline = time.monotonic() + 120
-                while not listing.exists() and time.monotonic() < deadline:
-                    time.sleep(0.1)
-
-            await asyncio.to_thread(wait_for_listing)
-            states = list((router.home / "follow_cwd" / "state").glob("*.json"))
+        def listing_and_children() -> tuple[list[str], list[dict[str, Any]]]:
+            deadline = time.monotonic() + 120
+            while not listing.exists() and time.monotonic() < deadline:
+                time.sleep(0.1)
+            states = list((harness.home / "follow_cwd" / "state").glob("*.json"))
             return listing.read_text().splitlines() if listing.exists() else [], [
                 child for state in states for child in json.loads(state.read_text())["children"]
             ]
 
-        extensions, children = run_router(tmp_path, scenario, launch_in="main")
+        async def main() -> tuple[list[str], list[dict[str, Any]]]:
+            async with harness.opened_by_claude_code():
+                return await asyncio.to_thread(listing_and_children)
+
+        extensions, children = asyncio.run(asyncio.wait_for(main(), timeout=300))
 
         assert ".py" in extensions
         assert [child["root"] for child in children] == [str(tmp_path.resolve() / "parent" / "a")]
