@@ -90,7 +90,7 @@ class Router:
         """
         prefix: list[ContentBlock] = []
         if target.root != self._launch_root:
-            prefix.append(TextContent(text=f"[serena project {reply.project_name} at {target.root}]"))
+            prefix.append(TextContent(text=f"[serena project {reply.project_name} at {target.root}]\n"))
         content: list[ContentBlock]
         if own_text is not None:
             self._projects_with_activation_text.add(target.root)

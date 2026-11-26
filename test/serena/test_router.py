@@ -596,7 +596,7 @@ class TestActivationText:
         assert blocks["a_first"][0].startswith(ACTIVATION_PREFIX) and "project with name 'a'" in blocks["a_first"][0]
         assert len(blocks["a_first"]) == 2 and not blocks["a_first"][1].startswith(HEADER_PREFIX)
         assert len(blocks["a_second"]) == 1 and not blocks["a_second"][0].startswith((HEADER_PREFIX, ACTIVATION_PREFIX))
-        assert blocks["b_first"][0] == f"[serena project b at {base / 'b'}]"
+        assert blocks["b_first"][0] == f"[serena project b at {base / 'b'}]\n"
         assert blocks["b_first"][1].startswith(ACTIVATION_PREFIX) and "project with name 'b'" in blocks["b_first"][1]
         assert len(blocks["b_second"]) == 2 and blocks["b_second"][0] == blocks["b_first"][0]
 
