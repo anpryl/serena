@@ -731,7 +731,7 @@ class TestEagerStart:
         pool = _RecordingPool()
         router = Router(pool, WorkingDirectories(Path("/")), launch_dir=Path("/"))
 
-        asyncio.run(router.start_launch_child(_NoRoots()))
+        asyncio.run(router.start_launch_child())
 
         assert pool.targets == []
 
@@ -740,16 +740,11 @@ class TestEagerStart:
         pool = _RecordingPool(fail_first=True)
         router = Router(pool, WorkingDirectories(tmp_path), launch_dir=tmp_path)
 
-        asyncio.run(router.start_launch_child(_NoRoots()))
-        asyncio.run(router.start_launch_child(_NoRoots()))
+        asyncio.run(router.start_launch_child())
+        asyncio.run(router.start_launch_child())
 
         assert [target.root for target in pool.targets] == [tmp_path.resolve()] * 2
         assert all(target.trusted for target in pool.targets)
-
-
-class _NoRoots:
-    async def list_roots(self) -> list[Path] | None:
-        return None
 
 
 class _RecordingPool:

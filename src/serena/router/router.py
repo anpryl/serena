@@ -49,19 +49,17 @@ class Router:
         self._result_cap = result_cap or ResultCap()
         self._projects_with_activation_text: set[Path] = set()
 
-    async def start_launch_child(self, client_roots: RootsSource) -> None:
+    async def start_launch_child(self) -> None:
         """
         Starts the child of the launch folder's project, so that its code-file list exists before the first call.
-        Does nothing when the launch folder is in no project. A failure is logged and never raised: the first call
-        to the project starts the child again.
-
-        :param client_roots: where to ask for the client's roots, which decide the trust of the project
+        The project is trusted without asking for the client's roots: the launch folder lies inside it, as in a
+        classic launch with ``--project-from-cwd``. Does nothing when the launch folder is in no project. A failure
+        is logged and never raised: the first call to the project starts the child again.
         """
         if self._launch_root is None:
             return
         try:
-            trusted = await self._working_directories.covers(self._launch_root, client_roots)
-            await self._pool.activation(CallTarget(root=self._launch_root, caller_dir=self._launch_root, trusted=trusted))
+            await self._pool.activation(CallTarget(root=self._launch_root, caller_dir=self._launch_root, trusted=True))
         except Exception as e:
             log.warning("Could not start the child Serena for the launch folder %s ahead of the first call: %s", self._launch_root, e)
 

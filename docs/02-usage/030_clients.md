@@ -276,7 +276,7 @@ The router marks `get_symbols_overview`, `find_symbol`, `find_referencing_symbol
 200,000, so Claude Code shows results up to that size inline. The router cuts a longer result and appends a notice
 that names the arguments for a narrower call.
 
-**Children.** The router starts the launch folder's child when Claude Code connects, if that folder is in a project.
+**Children.** The router starts the launch folder's child as soon as the router starts, if that folder is in a project.
 Other children start on their project's first call. A child that no call has used for 60 minutes stops. When 8
 children run, starting another one first stops the least recently used idle child. The next call to a stopped or
 crashed child's project starts it again.

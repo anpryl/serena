@@ -4,7 +4,6 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
 
 import anyio
 from mcp.server.mcpserver import MCPServer as FastMCP
@@ -17,7 +16,7 @@ from serena.router.child_pool import ChildOptions, ChildPool
 from serena.router.project_facts import ProjectInspector
 from serena.router.router import Router
 from serena.router.status_file import StatusFile
-from serena.router.working_directories import ClientRoots, WorkingDirectories
+from serena.router.working_directories import WorkingDirectories
 from serena.util.logging import MemoryLogHandler
 from serena.util.project_root import find_project_root
 
@@ -72,12 +71,7 @@ class RouterMCPFactory(SerenaMCPFactory):
                 anyio.create_task_group() as eager_starts,
             ):
                 router = Router(pool, working_directories)
-
-                async def on_initialized(context: Any, _: object) -> None:
-                    # in a task of its own: asking the client for its roots needs the receive loop that runs this handler
-                    eager_starts.start_soon(router.start_launch_child, ClientRoots(context.session))
-
-                mcp_server._lowlevel_server.add_notification_handler("notifications/initialized", NotificationParams, on_initialized)
+                eager_starts.start_soon(router.start_launch_child)
                 catalog = RouterToolCatalog(
                     self.agent,
                     router,
