@@ -41,13 +41,17 @@ HEADER_PREFIX = "[serena project "
 ACTIVATION_PREFIX = "<serena>"
 MAX_RESULT_SIZE_KEY = "anthropic/maxResultSizeChars"
 ALWAYS_LOAD_KEY = "anthropic/alwaysLoad"
+CAPABILITIES_META_KEY = "io.modelcontextprotocol/clientCapabilities"
 CLAUDE_CODE_META = {
     "io.modelcontextprotocol/protocolVersion": "2026-07-28",
     "io.modelcontextprotocol/clientInfo": {"name": "claude-code", "title": "Claude Code", "version": "2.1.328"},
-    "io.modelcontextprotocol/clientCapabilities": {"roots": {"listChanged": True}, "elicitation": {"form": {}, "url": {}}},
+    CAPABILITIES_META_KEY: {"roots": {"listChanged": True}, "elicitation": {"form": {}, "url": {}}},
 }
 # the source repo accumulates an ignored .serena folder (memories, caches) whenever other tests run in it in place
 _COPY_IGNORE = shutil.ignore_patterns(".serena", "__pycache__")
+
+
+TRUST_ALL_CONFIG = "projects: []\nlanguage_backend: LSP\ntrusted_project_path_patterns:\n- '**'\n"
 
 
 def _git(folder: Path, *arguments: str) -> None:
@@ -102,6 +106,7 @@ class RouterHarness:
         _git(self.other, "init", "-q")
 
         self.session: ClientSession | None = None
+        self._claude_code_call: Callable[..., Awaitable[dict[str, Any]]] | None = None
         self.router_pid = 0
         self.roots: list[Path] | None = None
         self.instructions: str | None = None
@@ -120,12 +125,18 @@ class RouterHarness:
             yield self
 
     @asynccontextmanager
-    async def opened_by_claude_code(self) -> AsyncIterator["RouterHarness"]:
+    async def opened_by_claude_code(self, declares_roots: bool = True) -> AsyncIterator["RouterHarness"]:
         """
         Starts the router and opens the connection over raw stdio with the requests Claude Code 2.1.328 sends: protocol
         2026-07-28 named in each request's ``_meta``, with no ``initialize`` and no ``notifications/initialized``.
-        Enters once the tool list is answered, without calling a tool.
+        Enters once the tool list is answered, without calling a tool; :meth:`call_as_claude_code` calls one.
+
+        :param declares_roots: whether the ``_meta`` of each request declares the ``roots`` client capability
         """
+        capabilities = dict(CLAUDE_CODE_META[CAPABILITIES_META_KEY])
+        if not declares_roots:
+            del capabilities["roots"]
+        meta = {**CLAUDE_CODE_META, CAPABILITIES_META_KEY: capabilities}
         parameters = self._server_parameters()
         process = await asyncio.create_subprocess_exec(
             parameters.command,
@@ -141,7 +152,7 @@ class RouterHarness:
         stdin, stdout = process.stdin, process.stdout
 
         async def request(request_id: str | int, method: str, **params: Any) -> None:
-            message = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": {"_meta": CLAUDE_CODE_META, **params}}
+            message = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": {"_meta": meta, **params}}
             stdin.write(json.dumps(message).encode() + b"\n")
             await stdin.drain()
 
@@ -167,6 +178,17 @@ class RouterHarness:
             await request(2, "resources/list")
             await request(3, "tools/list")
             await response_to(3)
+            next_request_id = 4
+
+            async def call_tool(tool: str, arguments: dict[str, Any], input_responses: dict[str, Any] | None = None) -> dict[str, Any]:
+                nonlocal next_request_id
+                request_id = next_request_id
+                next_request_id += 1
+                extra = {} if input_responses is None else {"inputResponses": input_responses}
+                await request(request_id, "tools/call", name=tool, arguments=arguments, **extra)
+                return (await response_to(request_id))["result"]
+
+            self._claude_code_call = call_tool
             yield self
         finally:
             stdin.close()
@@ -175,6 +197,18 @@ class RouterHarness:
             except TimeoutError:
                 process.kill()
                 await process.wait()
+
+    async def call_as_claude_code(
+        self, tool: str, cwd: Path, input_responses: dict[str, Any] | None = None, **arguments: Any
+    ) -> dict[str, Any]:
+        """
+        Sends a ``tools/call`` over the connection opened by :meth:`opened_by_claude_code`.
+
+        :param input_responses: the ``inputResponses`` of a retry after an ``input_required`` result
+        :return: the raw JSON ``result`` of the response
+        """
+        assert self._claude_code_call is not None
+        return await self._claude_code_call(tool, {"cwd": str(cwd), **arguments}, input_responses)
 
     def _server_parameters(self) -> StdioServerParameters:
         return StdioServerParameters(
@@ -562,6 +596,46 @@ class TestTrust:
 
         assert before == [True, False]
         assert after == [True, True]
+
+    def test_a_client_of_protocol_2026_07_28_is_asked_for_its_roots_in_the_call_and_the_project_in_its_extra_folder_runs_trusted(
+        self, tmp_path: Path
+    ) -> None:
+        harness = RouterHarness(tmp_path, launch_in="main", config=TRUST_ALL_CONFIG)
+        marker = harness.make_activation_marker(harness.sibling)
+
+        async def main() -> tuple[dict[str, Any], dict[str, Any]]:
+            async with harness.opened_by_claude_code():
+                first = await harness.call_as_claude_code("find_symbol", harness.sibling, name_path_pattern="sib_only")
+                assert first.get("resultType") == "input_required", first
+                ((key, roots_request),) = first["inputRequests"].items()
+                assert roots_request["method"] == "roots/list"
+                roots = {"roots": [{"uri": harness.main.as_uri()}, {"uri": harness.sibling.as_uri()}]}
+                second = await harness.call_as_claude_code(
+                    "find_symbol", harness.sibling, input_responses={key: roots}, name_path_pattern="sib_only"
+                )
+                return first, second
+
+        _, second = asyncio.run(asyncio.wait_for(main(), timeout=300))
+
+        assert second.get("resultType") != "input_required", second
+        assert not second.get("isError"), second
+        assert marker.exists()
+
+    def test_a_client_of_protocol_2026_07_28_without_the_roots_capability_is_not_asked_and_the_launch_folder_decides(
+        self, tmp_path: Path
+    ) -> None:
+        harness = RouterHarness(tmp_path, launch_in="main", config=TRUST_ALL_CONFIG)
+        marker = harness.make_activation_marker(harness.sibling)
+
+        async def main() -> dict[str, Any]:
+            async with harness.opened_by_claude_code(declares_roots=False):
+                return await harness.call_as_claude_code("find_symbol", harness.sibling, name_path_pattern="sib_only")
+
+        result = asyncio.run(asyncio.wait_for(main(), timeout=300))
+
+        assert result.get("resultType") != "input_required", result
+        assert not result.get("isError"), result
+        assert not marker.exists()
 
     def test_the_routers_untrusted_option_makes_every_child_untrusted(self, tmp_path: Path) -> None:
         async def scenario(router: RouterHarness) -> bool:
