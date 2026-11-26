@@ -70,6 +70,7 @@ class Router:
         :param client_roots: where to ask for the client's roots, which decide the trust of the call's project
         :return: the child's result, with the project's activation text and name where due
         :raises ToolError: if the call has no valid target or the child fails
+        :raises RootsRequired: if the client's roots are needed and the client can give them only in a retry of the call
         """
         try:
             target = self._resolver.resolve(arguments)
