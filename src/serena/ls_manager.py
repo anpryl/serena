@@ -404,7 +404,13 @@ class LanguageServerFileChangeNotifier:
             for rel_path in relevant_created_paths:
                 try:
                     with ls.open_file(rel_path):
-                        pass
+                        # gopls loads no package for a file in a directory it did not know, neither on the
+                        # notification nor on an open/close; a request that needs the file's types makes it
+                        # load (golang/go#83278). Hover is such a request; it is sent to every backend.
+                        try:
+                            ls.request_hover(rel_path, 0, 0)
+                        except Exception as e:
+                            log.debug(f"Hover on newly created file {rel_path!r} failed", exc_info=e)
                 except Exception as e:
                     log.error(f"Failed to refresh newly created file {rel_path!r} in language server", exc_info=e)
 

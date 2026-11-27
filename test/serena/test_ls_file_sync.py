@@ -3,7 +3,8 @@ End-to-end test for language server file synchronisation as a result of external
 
 Exercises all three ``FileChangeType`` branches against a real pyright backend:
 Created (new caller file), Changed (append a second caller), Deleted (remove the caller file).
-Also covers a Roslyn-specific Created regression (test_new_csharp_file_is_folded_into_compilation).
+Also covers a Roslyn-specific Created regression (test_new_csharp_file_is_folded_into_compilation)
+and gopls missing a package created in a new directory (test_new_go_package_joins_references).
 """
 
 import json
@@ -236,3 +237,44 @@ def test_new_csharp_file_is_folded_into_compilation(tmp_path):
             f"expected the real compiler diagnostic for the missing Person(name, age, email) "
             f"argument, which only fires once the file is actually part of the compilation: {messages}"
         )
+
+
+@pytest.mark.go
+def test_new_go_package_joins_references(tmp_path):
+    """
+    Regression test for gopls (golang/go#83278): a .go file created in a new package directory after
+    the workspace is loaded never joined workspace-wide references. gopls loads no package for a
+    directory it did not know on didChangeWatchedFiles(Created) or on an open/close cycle alone.
+    """
+    repo_root = tmp_path / "repo"
+    shutil.copytree(get_repo_path(LanguageServerId.GO), repo_root)
+    # A library package and one user of it, both present when gopls starts. The test repo's root is
+    # package main, which cannot be imported.
+    (repo_root / "hub").mkdir()
+    (repo_root / "hub" / "hub.go").write_text("package hub\n\nfunc Pulse() int { return 1 }\n", encoding="utf-8")
+    (repo_root / "use1").mkdir()
+    (repo_root / "use1" / "use1.go").write_text(
+        'package use1\n\nimport "test_repo/hub"\n\nfunc One() int { return hub.Pulse() }\n', encoding="utf-8"
+    )
+    hub_rel = os.path.join("hub", "hub.go")
+    use1_rel = os.path.join("use1", "use1.go")
+    use3_rel = os.path.join("use3", "use3.go")
+
+    with agent_for_project_context(LanguageServerId.GO, str(repo_root)) as agent:
+        project = agent.get_active_project_or_raise()
+        ls = next(iter(agent.get_language_server_manager_or_raise().iter_language_servers()))
+
+        def referencing_files() -> set[str]:
+            # line 2 is "func Pulse() int { return 1 }"; column 5 is the start of "Pulse"
+            return {location["relativePath"] for location in ls.request_references(hub_rel, 2, 5)}
+
+        assert use1_rel in referencing_files(), "baseline: the existing user must be found"
+        assert project.ls_sync_file_system_changes() == 0, "the first poll only records the baseline"
+
+        (repo_root / "use3").mkdir()
+        (repo_root / use3_rel).write_text(
+            'package use3\n\nimport "test_repo/hub"\n\nfunc Three() int { return hub.Pulse() }\n', encoding="utf-8"
+        )
+        assert project.ls_sync_file_system_changes() == 1, "expected exactly one Created event"
+
+        assert use3_rel in referencing_files(), "a package created in a new directory must join references after the poll"
